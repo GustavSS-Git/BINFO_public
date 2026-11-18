@@ -1,0 +1,57 @@
+{
+  "orgnr": "746000-1865",
+  "namn": "Brf Albohem",
+  "kalla": {
+    "fil": "SBC årsredovisning.pdf",
+    "forvaltare": "SBC",
+    "verifieradMot": "sida 7 (Flerårsöversikt, PDF-sida — tryckt \"Sida 5 av 17\"), avgiftsinkludering nämnd i löptext"
+  },
+  "nyckeltal": {
+    "arsavgift_per_m2_brf_yta": 834,
+    "arsavgift_andel_av_rorelseintakter": 98.7,
+    "skuldsattning_per_m2_totalyta": 3188,
+    "skuldsattning_per_m2_brf_yta": 3186,
+    "sparande_per_m2_totalyta": 141,
+    "rantekanslighet": 3.82,
+    "energikostnad_per_m2_totalyta": 250
+  },
+  "avgiftInkluderar": {
+    "varme": "ja",
+    "vatten": "ja",
+    "tv": "ja",
+    "el": "nej",
+    "bredband": "okant"
+  },
+  "ovrigInfo": {
+    "antalMedlemmar": 22,
+    "avgiftInkluderarKallor": {
+      "varme": 13,
+      "vatten": 13,
+      "tv": 13,
+      "el": 7
+    }
+  },
+  "ovrigInfoVerifierad": true,
+  "ovrigInfoVerifiering": {
+    "antalMedlemmar": {
+      "sida": 6,
+      "tryckt": "Vid räkenskapsårets slut fanns det 22 medlemmar i föreningen."
+    },
+    "avgiftInkluderarKallor.varme": {
+      "sida": 13,
+      "tryckt": "I årsavgiften ingår kostnader för kabel-tv, vatten och värme."
+    },
+    "avgiftInkluderarKallor.vatten": {
+      "sida": 13,
+      "tryckt": "Samma mening som varme ovan."
+    },
+    "avgiftInkluderarKallor.tv": {
+      "sida": 13,
+      "tryckt": "Samma mening som varme ovan (\"kabel-tv\" = tv)."
+    },
+    "avgiftInkluderarKallor.el": {
+      "sida": 7,
+      "tryckt": "Kostnader för medlemmarnas elförbrukning ingår inte i årsavgiften."
+    }
+  }
+}

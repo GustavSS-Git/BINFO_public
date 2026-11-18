@@ -1,0 +1,1261 @@
+import { describe, expect, it } from "vitest";
+import type { RedFlag } from "@/types/analysis";
+import { REFINANSIERINGSFLAGGA_ID } from "./refinansieringsflagga";
+import { flaggarBaraOmSaknatByggar, utanByggarSaknasMeningar } from "./assemble";
+import {
+  assembleraAnalys,
+  avgiftsavvikelseFraga,
+  beraknaAndelAvForeningensSkuld,
+  byggPrisanalys,
+  tillPrisInput,
+  utanNyckeltalsantal,
+} from "./assemble";
+import { extraktion } from "./__fixtures__/extraktion";
+import { DemoPrisdatakalla, ModellPrisdatakalla, TomPrisdatakalla } from "./prisdata";
+import { konfidensUtanPrisdata, konfidensUtanPostnummer } from "./prisdata";
+import { AnalysisResultSchema } from "./schema";
+import type { AnalysJudgement } from "./analyze";
+import type {
+  ExtractionResult,
+  Figure,
+  Forening,
+  KeyFigureId,
+  PropertyInput,
+} from "@/types/analysis";
+
+const analysJudgement: AnalysJudgement = {
+  betyg: "C",
+  betygMotivering: "Rimlig finansiell ställning men avgiften är räntekänslig.",
+  rodaFlaggor: [
+    {
+      id: "hog-rantekanslighet",
+      titel: "Avgiften är räntekänslig",
+      beskrivning: "Räntekänsligheten är 9,2 % enligt årsredovisningen.",
+      severity: "medel",
+      harledsFran: ["rantekanslighet"],
+    },
+  ],
+  fragor: [
+    {
+      id: "fraga-stambyte",
+      fraga: "Hur ska stambytet 2028 finansieras?",
+      ursprung: "analys",
+      riktadTill: "styrelsen",
+      varfor: "Stort planerat underhåll samtidigt som sparandet är lågt.",
+    },
+  ],
+};
+
+/** Allt känt — inget Tristate-fält på 'okant', vaning/byggar satta. */
+const inputKomplett: PropertyInput = {
+  kind: "bostadsratt",
+  utgangspris: 4_950_000,
+  boarea: 62,
+  antalRum: 3,
+  manadsavgift: 4200,
+  andelstal: 2.1,
+  orgnr: "769612-3456",
+  adress: "Kastanjevägen 4",
+  postnummer: "11857",
+  ort: "Stockholm",
+  vaning: 3,
+  byggar: 1962,
+  hiss: "ja",
+  balkong: "nej",
+  avgiftInkluderar: { varme: "ja", vatten: "ja", el: "nej", bredband: "ja", tv: "nej" },
+  antalPersoner: 2,
+};
+
+/** Allt Tristate-fält på 'okant'; vaning/byggar kända, isolerar frågeräkningen. */
+const inputAllaOkanda: PropertyInput = {
+  ...inputKomplett,
+  hiss: "okant",
+  balkong: "okant",
+  avgiftInkluderar: {
+    varme: "okant",
+    vatten: "okant",
+    el: "okant",
+    bredband: "okant",
+    tv: "okant",
+  },
+};
+
+function extraktionUtanRantekanslighet(): ExtractionResult {
+  const forening: Forening = {
+    ...extraktion.forening,
+    keyFigures: extraktion.forening.keyFigures.map((kf) =>
+      kf.id === "rantekanslighet"
+        ? { ...kf, status: "okant", figure: { value: null, unit: "procent", source: "berakning" } }
+        : kf,
+    ),
+  };
+  return { ...extraktion, forening };
+}
+
+describe("assembleraAnalys", () => {
+  it("producerar noll saknad_uppgift-frågor och full uppgiftskännedom när allt är känt", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect(resultat.fragor.filter((f) => f.ursprung === "saknad_uppgift")).toHaveLength(0);
+    expect(resultat.datakvalitet.uppgifterKanda).toBe(resultat.datakvalitet.uppgifterTotalt);
+    expect(resultat.datakvalitet.saknadeFalt).toHaveLength(0);
+    // analys-frågorna följer med oförändrade.
+    expect(resultat.fragor.some((f) => f.id === "fraga-stambyte")).toBe(true);
+  });
+
+  it("genererar en saknad_uppgift-fråga per okänt Tristate-fält och minskar uppgifterKanda i motsvarande grad", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputAllaOkanda,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    const saknadUppgift = resultat.fragor.filter((f) => f.ursprung === "saknad_uppgift");
+    // hiss + balkong + 3 avgiftInkluderar-poster (el, bredband, tv) = 5 okända Tristate-fält.
+    // Värme och vatten ingår aldrig i analysen (ägarbeslut 2026-10-26).
+    expect(saknadUppgift).toHaveLength(5);
+    expect(saknadUppgift.some((f) => /varme|vatten/.test(f.id))).toBe(false);
+    expect(resultat.datakvalitet.uppgifterTotalt).toBe(7);
+    expect(resultat.datakvalitet.uppgifterKanda).toBe(2); // vaning + byggar
+    expect(resultat.datakvalitet.saknadeFalt).toHaveLength(5);
+    expect(resultat.datakvalitet.saknadeFalt.join(" ")).not.toMatch(/varme|vatten/);
+    // Varje fråga ska vara en riktig, avslutad svensk fråga, inte en platshållare.
+    for (const fraga of saknadUppgift) {
+      expect(fraga.fraga.length).toBeGreaterThan(0);
+      expect(fraga.riktadTill).toBe("maklaren");
+    }
+  });
+
+  it("hoppar över en avgiftInkluderar-fråga när föreningen redan gett ett definitivt svar", async () => {
+    const foreningMedSvar: Forening = {
+      ...extraktion.forening,
+      avgiftInkluderarEnligtForening: {
+        varme: "ja",
+        vatten: "okant",
+        el: "nej",
+        bredband: "okant",
+        tv: "okant",
+      },
+    };
+    const resultat = await assembleraAnalys({
+      extraction: { ...extraktion, forening: foreningMedSvar },
+      input: inputAllaOkanda,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    const saknadUppgift = resultat.fragor.filter((f) => f.ursprung === "saknad_uppgift");
+    // varme och el har redan definitiva svar i föreningen -> ingen fråga för dem.
+    // hiss, balkong, bredband, tv kvarstår = 4 (värme och vatten frågas aldrig i analysen).
+    expect(saknadUppgift).toHaveLength(4);
+    expect(saknadUppgift.some((f) => f.id.includes("vatten"))).toBe(false);
+    expect(saknadUppgift.some((f) => f.id.includes("varme"))).toBe(false);
+    expect(saknadUppgift.some((f) => f.id.includes("el"))).toBe(false);
+  });
+
+  it("TomPrisdatakalla ger en Prisanalys utan avvikelsefält och med konfidensUtanPrisdata()", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect("avvikelseMotVardering" in resultat.prisanalys).toBe(false);
+    expect("avvikelseMotForeningen" in resultat.prisanalys).toBe(false);
+    expect(resultat.prisanalys.konfidens).toEqual(konfidensUtanPrisdata());
+    expect(resultat.prisanalys.slutsats).toMatch(/ingen oberoende/i);
+  });
+
+  describe("ModellPrisdatakalla — task 4g/5, Binfos egen värderingsmodell", () => {
+    const modellkalla = () => new ModellPrisdatakalla();
+
+    it("ger 'medel' konfidens för ett kartlagt Stockholmsområde, aldrig 'hog'", async () => {
+      // inputKomplett.postnummer = "11857" -> Södermalm i den riktiga
+      // kartläggningstabellen (src/lib/vardering/data/postnummerOmrade.data.ts).
+      const prisanalys = await byggPrisanalys(inputKomplett, modellkalla());
+
+      expect(prisanalys.externVardering?.value).not.toBeNull();
+      expect(prisanalys.externVardering?.source).toBe("schablon");
+      expect(prisanalys.konfidens.niva).toBe("medel");
+      expect(prisanalys.varderingsunderlag?.omrade).toBe("Södermalm");
+      expect(prisanalys.budpremie).toBeDefined();
+    });
+
+    it("beskriver aldrig modellen som en tredjepartsvärdering", async () => {
+      const prisanalys = await byggPrisanalys(inputKomplett, modellkalla());
+
+      expect(prisanalys.externVardering?.leverantor).toMatch(/^Binfo värderingsmodell /);
+      expect(prisanalys.slutsats).toMatch(/Binfos värderingsmodell/);
+      // Får inte påstå att priset stämts av mot en tredjepartsvärdering.
+      expect(prisanalys.slutsats).not.toMatch(/extern värdering/i);
+    });
+
+    it("säger i slutsatsen om utgångspriset ligger inom eller utanför modellens intervall", async () => {
+      const prisanalys = await byggPrisanalys(inputKomplett, modellkalla());
+
+      // Owner 2026-10-26: inside the ±10 % span = in line with the model, otherwise
+      // over/under the span; never a 90 % interval, never "kan vara attraktivt".
+      expect(prisanalys.slutsats).toMatch(
+        /(i linje med modellen: det ligger inom|ligger (över|under)) det ungefärliga spannet [\d\s\u00a0]+ – [\d\s\u00a0]+ kr \(±10 %\)/,
+      );
+      expect(prisanalys.slutsats).not.toMatch(/90-procentiga|attraktivt/);
+      expect(prisanalys.slutsats).not.toMatch(/\d,\d % (över|under) Binfos värderingsmodell/);
+    });
+
+    it("räknar fram avvikelsen mot modellens punktskattning", async () => {
+      const prisanalys = await byggPrisanalys(inputKomplett, modellkalla());
+
+      // utgångspris 4 950 000 mot modellens punktskattning för 11857 (Södermalm),
+      // ett deterministiskt tal ur den tränade modellen (valuation-v3.1; v3 gav -25,6).
+      expect(prisanalys.avvikelseMotVardering).toBeCloseTo(-22.3, 0);
+    });
+
+    it("faller tillbaka till 'lag' konfidens och Stockholmsövergripande område för ett okartlagt men känt Stockholmsprefix", async () => {
+      // 12364 delar 3-siffersprefixet 123 med kartlagda koder (t.ex. 12322 ->
+      // Farsta-Vantör) men är inte självt kartlagt.
+      const prisanalys = await byggPrisanalys(
+        { ...inputKomplett, postnummer: "12364" },
+        modellkalla(),
+      );
+
+      expect(prisanalys.externVardering?.value).not.toBeNull();
+      expect(prisanalys.konfidens.niva).toBe("lag");
+      expect(prisanalys.varderingsunderlag?.omrade).toBeNull();
+      expect(prisanalys.budpremie?.omrade).toBeNull();
+      expect(prisanalys.konfidens.skal?.join(" ")).toMatch(/inte kopplas till ett specifikt/i);
+    });
+
+    it("ger 'lag' konfidens och en skälförklaring som anger metod och baslinje för övriga Stockholms län (Solna)", async () => {
+      const prisanalys = await byggPrisanalys(
+        { ...inputKomplett, postnummer: "16900" },
+        modellkalla(),
+      );
+
+      expect(prisanalys.externVardering?.value).not.toBeNull();
+      expect(prisanalys.externVardering?.source).toBe("schablon");
+      expect(prisanalys.konfidens.niva).toBe("lag");
+      const skal = prisanalys.konfidens.skal?.join(" ") ?? "";
+      expect(skal).toMatch(/generella samband från Binfos Stockholmsmodell/);
+      expect(skal).toMatch(/genomsnittspriset i Solna/);
+      expect(skal).toMatch(/64\s352 kr\/m², Svensk Mäklarstatistik, sep 2025/);
+      expect(skal).toMatch(/inte tränad på försäljningar i Solna/);
+      expect(prisanalys.varderingsunderlag).toMatchObject({
+        tackning: "lan",
+        kommun: "Solna",
+        omrade: null,
+        prisniva: { region: "Solna", krPerM2: 64352, kalla: "Svensk Mäklarstatistik" },
+      });
+      expect(prisanalys.slutsats).toMatch(/Solna/);
+      expect("budpremie" in prisanalys).toBe(false);
+    });
+
+    it("Huddinge-postnumren som står som Stockholmsområden i områdeskartan värderas som Huddinge ('lan')", async () => {
+      const prisanalys = await byggPrisanalys(
+        { ...inputKomplett, postnummer: "12352" },
+        modellkalla(),
+      );
+
+      expect(prisanalys.konfidens.niva).toBe("lag");
+      expect(prisanalys.varderingsunderlag).toMatchObject({
+        tackning: "lan",
+        kommun: "Huddinge",
+        omrade: null,
+      });
+      expect("budpremie" in prisanalys).toBe(false);
+    });
+
+    it("värderar även utanför Stockholms län, med 'lag' konfidens och en tydlig förklaring (Göteborg)", async () => {
+      const prisanalys = await byggPrisanalys(
+        { ...inputKomplett, postnummer: "40010" },
+        modellkalla(),
+      );
+
+      expect(prisanalys.externVardering?.value).not.toBeNull();
+      expect(prisanalys.konfidens.niva).toBe("lag");
+      const skal = prisanalys.konfidens.skal?.join(" ") ?? "";
+      expect(skal).toMatch(/Binfo är byggt för bostadsrätter i Stockholms län/);
+      expect(skal).toMatch(/utanför Stockholms län/);
+      expect(skal).toMatch(
+        /riksgenomsnittet för bostadsrätter \(46\s317 kr\/m², Svensk Mäklarstatistik, aug 2026\)/,
+      );
+      expect(skal).toMatch(/betydligt mindre träffsäker/);
+      expect(prisanalys.varderingsunderlag).toMatchObject({
+        tackning: "utanfor_lan",
+        kommun: "Göteborg",
+        prisniva: { region: "Riket", krPerM2: 46317 },
+      });
+      expect("budpremie" in prisanalys).toBe(false);
+      // Aldrig 'hog' eller 'medel' utanför Stockholms kommun.
+      expect(prisanalys.konfidens.niva).not.toBe("hog");
+    });
+
+    it("sätter tackning/kommun på varderingsunderlag även i Stockholm, utan prisniva", async () => {
+      const prisanalys = await byggPrisanalys(inputKomplett, modellkalla());
+
+      expect(prisanalys.varderingsunderlag).toMatchObject({
+        tackning: "stockholm",
+        kommun: "Stockholm",
+      });
+      expect(prisanalys.varderingsunderlag && "prisniva" in prisanalys.varderingsunderlag).toBe(
+        false,
+      );
+    });
+
+    it("ger ingen värdering alls, och en postnummer-specifik lågkonfidensförklaring, för ett tomt postnummer (anonymiserad rapport)", async () => {
+      const prisanalys = await byggPrisanalys({ ...inputKomplett, postnummer: "" }, modellkalla());
+
+      expect("externVardering" in prisanalys).toBe(false);
+      expect("varderingsunderlag" in prisanalys).toBe(false);
+      expect("budpremie" in prisanalys).toBe(false);
+      expect(prisanalys.konfidens).toEqual(konfidensUtanPostnummer());
+      expect(prisanalys.slutsats).toMatch(/Postnumret saknas eller är ogiltigt/);
+    });
+
+    it("ger samma besked för ett felformaterat postnummer", async () => {
+      const prisanalys = await byggPrisanalys(
+        { ...inputKomplett, postnummer: "115-32" },
+        modellkalla(),
+      );
+
+      expect("externVardering" in prisanalys).toBe(false);
+      expect(prisanalys.konfidens).toEqual(konfidensUtanPostnummer());
+    });
+
+    it("en riktig extern källa höjer däremot konfidensen (utan att koppla på något varderingsunderlag)", async () => {
+      // Samma form som modellen, men source 'extern' — bevisar att det är
+      // källans proveniens som styr konfidensen, inte att ett värde finns.
+      // Postnumret (11857) ligger inom modellens räckvidd, men eftersom
+      // källan inte är en schablon kopplas inget varderingsunderlag på.
+      const riktigKalla = {
+        hamtaVardering: async () => ({
+          value: 5_000_000,
+          unit: "kr" as const,
+          source: "extern" as const,
+          leverantor: "Testleverantör",
+        }),
+        hamtaForsaljningarIForeningen: async () => [],
+        hamtaOmradeMedian: async () => null,
+      };
+
+      const prisanalys = await byggPrisanalys(inputKomplett, riktigKalla);
+
+      expect(prisanalys.konfidens.niva).toBe("medel");
+      expect("varderingsunderlag" in prisanalys).toBe(false);
+    });
+  });
+
+  it("DemoPrisdatakallans null-värden ger utelämnade avvikelsefält, aldrig en påhittad procentsats", async () => {
+    // Testar byggPrisanalys direkt (inte assembleraAnalys) — se kommentaren
+    // i nästa test om varför hela vägen genom AnalysisResultSchema idag
+    // inte går att köra för DemoPrisdatakalla.
+    const prisanalys = await byggPrisanalys(
+      inputKomplett,
+      new DemoPrisdatakalla({
+        utgangspris: inputKomplett.utgangspris ?? 0,
+        boarea: inputKomplett.boarea,
+      }),
+    );
+
+    expect("avvikelseMotVardering" in prisanalys).toBe(false);
+    expect("avvikelseMotForeningen" in prisanalys).toBe(false);
+    // Externvärderingen finns strukturellt (för UI:t) men bär inget tal.
+    expect(prisanalys.externVardering?.value).toBeNull();
+    expect(prisanalys.konfidens).toEqual(konfidensUtanPrisdata());
+  });
+
+  it("slutförs och validerar när priskällan fyller i externVardering (regression: FigureSchema.and(leverantor) avvisade tidigare varje populerad externVardering)", async () => {
+    // schema.ts definierade tidigare externVardering som
+    // FigureSchema.and(z.object({ leverantor: z.string() })). FigureSchema
+    // är .strict(), och Zod validerar båda sidor av en intersection mot
+    // HELA det sammanslagna objektet — den strikta sidan avvisade då
+    // 'leverantor' som ett okänt fält, så EVERY Prisanalys med en populerad
+    // externVardering (vilket DemoPrisdatakalla alltid producerar, och
+    // vilket varje riktig priskälla i produktion också kommer göra) kunde
+    // aldrig validera mot AnalysisResultSchema. Fixat i schema.ts genom att
+    // bygga externVardering med .extend() på FigureSchemas bas istället för
+    // en strikt-mot-strikt intersection. Detta test låser fastet.
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new DemoPrisdatakalla({
+        utgangspris: inputKomplett.utgangspris ?? 0,
+        boarea: inputKomplett.boarea,
+      }),
+      analys: analysJudgement,
+    });
+
+    expect(resultat.prisanalys.externVardering?.leverantor).toContain("PLATSHÅLLARE");
+  });
+
+  it("räknar prisPerM2 korrekt och avrundar till heltal", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    // 4 950 000 / 62 = 79 838,709... -> 79 839
+    expect(resultat.prisanalys.prisPerM2?.value).toBe(79839);
+    expect(resultat.prisanalys.prisPerM2?.source).toBe("berakning");
+    expect(Number.isInteger(resultat.prisanalys.prisPerM2?.value)).toBe(true);
+  });
+
+  it("degraderar i stället för att kasta när räntekänslighet saknas i årsredovisningen — resten av analysen slutförs", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktionUtanRantekanslighet(),
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect(resultat.rantestress.rantekanslighetProcent).toBeNull();
+    expect(resultat.rantestress.scenarier).toEqual([]);
+    expect(resultat.betyg).toBe(analysJudgement.betyg);
+  });
+
+  it("lägger till en deterministisk fråga till mäklaren när räntekänslighet saknas", async () => {
+    // Egen analys utan analysJudgement:s "hog-rantekanslighet"-flagga (den
+    // handlar om ett KÄNT värde på 9,2 %, inte om att uppgiften saknas) —
+    // annars skulle dedup-kontrollen (harledsFran) skymma just det den här
+    // testen ska visa.
+    const analysUtanRantekanslighetsomnamnande: AnalysJudgement = {
+      ...analysJudgement,
+      rodaFlaggor: [],
+    };
+    const resultat = await assembleraAnalys({
+      extraction: extraktionUtanRantekanslighet(),
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysUtanRantekanslighetsomnamnande,
+    });
+
+    const fraga = resultat.fragor.find((f) => f.id === "saknar-rantekanslighet");
+    expect(fraga).toBeDefined();
+    expect(fraga?.ursprung).toBe("analys");
+    expect(fraga?.riktadTill).toBe("maklaren");
+  });
+
+  it("hoppar över den deterministiska frågan om pass 2 redan skrev en fråga om räntekänslighet", async () => {
+    const analysMedEgenFraga: AnalysJudgement = {
+      ...analysJudgement,
+      fragor: [
+        {
+          id: "egen-fraga-om-rantekanslighet",
+          fraga: "Hur mycket påverkas avgiften av räntekänslighet?",
+          ursprung: "analys",
+          riktadTill: "styrelsen",
+          varfor: "Uppgiften saknas i rapporten.",
+        },
+      ],
+    };
+    const resultat = await assembleraAnalys({
+      extraction: extraktionUtanRantekanslighet(),
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysMedEgenFraga,
+    });
+
+    expect(resultat.fragor.some((f) => f.id === "saknar-rantekanslighet")).toBe(false);
+    // (the fixture's lokal loss signal adds its own deterministic question)
+    expect(resultat.fragor.filter((f) => !f.id.startsWith("lokal-"))).toHaveLength(1);
+  });
+
+  it("hoppar över den deterministiska frågan om pass 2 redan flaggat räntekänslighet (harledsFran)", async () => {
+    const analysMedEgenFlagga: AnalysJudgement = {
+      ...analysJudgement,
+      fragor: [],
+      rodaFlaggor: [
+        {
+          id: "saknad-rantekanslighet-flagga",
+          titel: "Räntekänslighet går inte att kontrollera",
+          beskrivning: "Uppgiften saknas i rapporten.",
+          severity: "lag",
+          harledsFran: ["rantekanslighet"],
+        },
+      ],
+    };
+    const resultat = await assembleraAnalys({
+      extraction: extraktionUtanRantekanslighet(),
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysMedEgenFlagga,
+    });
+
+    expect(resultat.fragor.some((f) => f.id === "saknar-rantekanslighet")).toBe(false);
+  });
+
+  it("sänker extraktionskonfidensen högst ett steg (hog -> medel) när räntekänslighet saknas", async () => {
+    const extraktionUtanRK: ExtractionResult = {
+      ...extraktionUtanRantekanslighet(),
+      datakvalitet: {
+        ...extraktionUtanRantekanslighet().datakvalitet,
+        extraktionKonfidens: { niva: "hog" },
+      },
+    };
+    const resultat = await assembleraAnalys({
+      extraction: extraktionUtanRK,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect(resultat.datakvalitet.extraktionKonfidens.niva).toBe("medel");
+    expect(resultat.datakvalitet.extraktionKonfidens.skal).toContain(
+      "Räntekänslighet saknas i årsredovisningen, så analysen är något osäkrare. Det här är den " +
+        "bästa bedömningen utifrån tillgängliga uppgifter.",
+    );
+  });
+
+  it("lämnar konfidensen 'lag' oförändrad (sänker aldrig mer än ett steg) när räntekänslighet saknas", async () => {
+    const extraktionUtanRK: ExtractionResult = {
+      ...extraktionUtanRantekanslighet(),
+      datakvalitet: {
+        ...extraktionUtanRantekanslighet().datakvalitet,
+        extraktionKonfidens: { niva: "lag", skal: ["Redan lågt av andra skäl."] },
+      },
+    };
+    const resultat = await assembleraAnalys({
+      extraction: extraktionUtanRK,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect(resultat.datakvalitet.extraktionKonfidens.niva).toBe("lag");
+  });
+
+  it("lämnar konfidensen 'medel' oförändrad — sänker bara hog -> medel, som tryckt-avvikelsen i runExtraction", async () => {
+    const extraktionUtanRK: ExtractionResult = {
+      ...extraktionUtanRantekanslighet(),
+      datakvalitet: {
+        ...extraktionUtanRantekanslighet().datakvalitet,
+        extraktionKonfidens: { niva: "medel" },
+      },
+    };
+    const resultat = await assembleraAnalys({
+      extraction: extraktionUtanRK,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect(resultat.datakvalitet.extraktionKonfidens.niva).toBe("medel");
+    expect(resultat.datakvalitet.extraktionKonfidens.skal).toHaveLength(1);
+  });
+
+  it("varken lägger till frågan eller sänker konfidensen när räntekänsligheten är känd (även när den är 0, t.ex. en skuldfri förening)", async () => {
+    const extraktionSkuldfri: ExtractionResult = {
+      ...extraktion,
+      forening: {
+        ...extraktion.forening,
+        keyFigures: extraktion.forening.keyFigures.map((kf) =>
+          kf.id === "rantekanslighet"
+            ? { ...kf, status: "god", figure: { value: 0, unit: "procent", source: "berakning" } }
+            : kf,
+        ),
+      },
+    };
+    const resultat = await assembleraAnalys({
+      extraction: extraktionSkuldfri,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect(resultat.fragor.some((f) => f.id === "saknar-rantekanslighet")).toBe(false);
+    expect(resultat.rantestress.rantekanslighetProcent).toBe(0);
+    expect(resultat.rantestress.kommentar).toMatch(/inga räntebärande lån/i);
+    expect(resultat.datakvalitet.extraktionKonfidens).toEqual(
+      extraktion.datakvalitet.extraktionKonfidens,
+    );
+  });
+
+  it("producerar ett resultat som validerar mot AnalysisResultSchema", async () => {
+    // TomPrisdatakalla, inte DemoPrisdatakalla: se testet ovan om den
+    // separata, oberoende bristen i schema.ts:s externVardering-definition.
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    const parsed = AnalysisResultSchema.safeParse(resultat);
+    expect(parsed.success).toBe(true);
+  });
+
+  it("innehåller aldrig manadskostnad — lånedata är inte längre del av det persisterade kontraktet", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect(resultat).not.toHaveProperty("manadskostnad");
+  });
+
+  it("sätter gratisSektioner till den fasta uppsättningen från kontraktet", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect(resultat.gratisSektioner).toEqual(["betyg", "rodaFlaggor_topp2", "datakvalitet"]);
+  });
+
+  it("kopierar input och förening rakt igenom, och slår ihop betyg/rodaFlaggor/fragor från pass 2", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect(resultat.input).toEqual(inputKomplett);
+    expect(resultat.forening).toEqual(extraktion.forening);
+    expect(resultat.betyg).toBe("C");
+    // The model's flags pass through; with dated loans Binfo's own refinancing
+    // flag (round 2026-10-26) is added from the fee prognosis.
+    expect(resultat.rodaFlaggor.filter((f) => f.id !== REFINANSIERINGSFLAGGA_ID)).toEqual(
+      analysJudgement.rodaFlaggor,
+    );
+    expect(resultat.analysisId).toBeTruthy();
+    expect(() => new Date(resultat.skapad).toISOString()).not.toThrow();
+  });
+
+  describe("injicerbara analysisId/skapad — för idempotent omkörning mot en befintlig jobbrad", () => {
+    const injiceradId = "some-fixed-id";
+    const injiceratDatum = "2026-01-01T00:00:00.000Z";
+
+    it("använder de injicerade värdena exakt, i stället för att generera egna", async () => {
+      const resultat = await assembleraAnalys({
+        extraction: extraktion,
+        input: inputKomplett,
+        prisdatakalla: new TomPrisdatakalla(),
+        analys: analysJudgement,
+        analysisId: injiceradId,
+        skapad: injiceratDatum,
+      });
+
+      expect(resultat.analysisId).toBe(injiceradId);
+      expect(resultat.skapad).toBe(injiceratDatum);
+    });
+
+    it("genererar ett UUID-format analysisId och ett parsbart ISO-datum när båda utelämnas", async () => {
+      const resultat = await assembleraAnalys({
+        extraction: extraktion,
+        input: inputKomplett,
+        prisdatakalla: new TomPrisdatakalla(),
+        analys: analysJudgement,
+      });
+
+      expect(resultat.analysisId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      );
+      expect(() => new Date(resultat.skapad).toISOString()).not.toThrow();
+    });
+
+    it("är idempotent: två anrop med samma injicerade analysisId/skapad ger byte-identiskt JSON", async () => {
+      const grundinput = {
+        extraction: extraktion,
+        input: inputKomplett,
+        prisdatakalla: new TomPrisdatakalla(),
+        analys: analysJudgement,
+        analysisId: injiceradId,
+        skapad: injiceratDatum,
+      };
+
+      const forstaKorningen = await assembleraAnalys(grundinput);
+      const andraKorningen = await assembleraAnalys(grundinput);
+
+      expect(JSON.stringify(andraKorningen)).toBe(JSON.stringify(forstaKorningen));
+    });
+  });
+});
+
+describe("utanNyckeltalsantal", () => {
+  it("tar bort antalet i 'av sju nyckeltal' så motiveringen inte hävdar ett totalantal sidan inte visar", () => {
+    expect(utanNyckeltalsantal("Två av sju nyckeltal har status 'svag'.")).toBe(
+      "Två av nyckeltalen har status 'svag'.",
+    );
+  });
+
+  it("behåller stor bokstav när meningen inleds med partivet", () => {
+    expect(utanNyckeltalsantal("Av de sju nyckeltalen är två svaga.")).toBe(
+      "Av nyckeltalen är två svaga.",
+    );
+  });
+
+  it("hanterar bestämd plural och tillägget 'lagstadgade'", () => {
+    expect(utanNyckeltalsantal("Två av de sju lagstadgade nyckeltalen är svaga.")).toBe(
+      "Två av nyckeltalen är svaga.",
+    );
+  });
+
+  it("rör en mening som redan står utan antal", () => {
+    expect(utanNyckeltalsantal("Avgiften styrs av nyckeltalen ovan.")).toBe(
+      "Avgiften styrs av nyckeltalen ovan.",
+    );
+  });
+
+  it("tillämpas på betygMotivering i den monterade rapporten", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: {
+        ...analysJudgement,
+        betygMotivering: "Två av sju nyckeltal har status 'svag', vilket ger betyg C.",
+      },
+    });
+
+    expect(resultat.betygMotivering).toBe(
+      "Två av nyckeltalen har status 'svag', vilket ger betyg C.",
+    );
+  });
+});
+
+/** Extraktionen med ETT nyckeltals figur utbytt. */
+function extraktionMed(id: KeyFigureId, figure: Figure): ExtractionResult {
+  return {
+    ...extraktion,
+    forening: {
+      ...extraktion.forening,
+      keyFigures: extraktion.forening.keyFigures.map((kf) =>
+        kf.id === id ? { ...kf, figure } : kf,
+      ),
+    },
+  };
+}
+
+describe("andelAvForeningensSkuld — lägenhetens andel av föreningens lån (bara full analys)", () => {
+  it("är skuldsättning per m² bostadsrättsyta × boarea, i kr, 'berakning', med nyckeltalets ref", async () => {
+    // Fixturen: 11 200 kr/m² (s. 8) × 62 m² = 694 400 kr.
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect(resultat.prisanalys.andelAvForeningensSkuld).toEqual({
+      value: 694_400,
+      unit: "kr",
+      source: "berakning",
+      ref: { page: 8, excerpt: "Skuldsättning kr/kvm bostadsrättsyta 11 200" },
+    });
+    expect(resultat.fragor.some((f) => f.id === "saknar-skuldsattning-per-m2")).toBe(false);
+    expect(AnalysisResultSchema.safeParse(resultat).success).toBe(true);
+  });
+
+  it("avrundar till hela kronor", () => {
+    const { forening } = extraktionMed("skuldsattning_per_m2_brf_yta", {
+      value: 7_633,
+      unit: "kr/m2",
+      source: "arsredovisning",
+      ref: { page: 4 },
+    });
+    // 7 633 × 54,5 = 415 998,5 -> 415 999
+    expect(beraknaAndelAvForeningensSkuld(forening, 54.5)?.value).toBe(415_999);
+    // 7 633 × 54,3 = 414 471,9 -> 414 472
+    expect(beraknaAndelAvForeningensSkuld(forening, 54.3)?.value).toBe(414_472);
+  });
+
+  it("för över osäkerheten från skuldnyckeltalet till kronbeloppet", () => {
+    const { forening } = extraktionMed("skuldsattning_per_m2_brf_yta", {
+      value: 7_633,
+      unit: "kr/m2",
+      source: "arsredovisning",
+      ref: { page: 4, excerpt: "Skuldsättning 7 633" },
+      osaker: "Utanför rimligt intervall.",
+    });
+    expect(beraknaAndelAvForeningensSkuld(forening, 54)?.osaker).toBe("Utanför rimligt intervall.");
+  });
+
+  it("visar inget kronbelopp när skuldnyckeltalet saknar sidhänvisning", () => {
+    const { forening } = extraktionMed("skuldsattning_per_m2_brf_yta", {
+      value: 7_633,
+      unit: "kr/m2",
+      source: "berakning",
+    });
+    expect(beraknaAndelAvForeningensSkuld(forening, 54)).toBeNull();
+  });
+
+  it("ger 0 kr för en skuldfri förening (härlett, citerat), utan fråga", async () => {
+    const ref = { page: 12, excerpt: "Föreningen har inga lån" };
+    const resultat = await assembleraAnalys({
+      extraction: extraktionMed("skuldsattning_per_m2_brf_yta", {
+        value: 0,
+        unit: "kr/m2",
+        source: "berakning",
+        ref,
+      }),
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect(resultat.prisanalys.andelAvForeningensSkuld).toEqual({
+      value: 0,
+      unit: "kr",
+      source: "berakning",
+      ref,
+    });
+    expect(resultat.fragor.some((f) => f.id === "saknar-skuldsattning-per-m2")).toBe(false);
+  });
+
+  it("utelämnas när nyckeltalet saknas, och en deterministisk fråga läggs till i stället", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktionMed("skuldsattning_per_m2_brf_yta", {
+        value: null,
+        unit: "kr/m2",
+        source: "berakning",
+      }),
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+
+    expect("andelAvForeningensSkuld" in resultat.prisanalys).toBe(false);
+    const fraga = resultat.fragor.find((f) => f.id === "saknar-skuldsattning-per-m2");
+    expect(fraga).toMatchObject({
+      fraga: "Hur stor är föreningens räntebärande skuld per kvadratmeter bostadsrättsyta?",
+      ursprung: "analys",
+      riktadTill: "maklaren",
+    });
+    expect(fraga?.varfor).toMatch(/hur stor del av föreningens lån lägenheten bär/);
+    expect(AnalysisResultSchema.safeParse(resultat).success).toBe(true);
+  });
+
+  it("använder aldrig skuldsättning per m² totalyta som reserv", () => {
+    const { forening } = extraktionMed("skuldsattning_per_m2_brf_yta", {
+      value: null,
+      unit: "kr/m2",
+      source: "arsredovisning",
+    });
+    // Fixturens totalyta-nyckeltal har ett värde — det får inte användas.
+    expect(
+      forening.keyFigures.find((kf) => kf.id === "skuldsattning_per_m2_totalyta")?.figure.value,
+    ).not.toBeNull();
+    expect(beraknaAndelAvForeningensSkuld(forening, 62)).toBeNull();
+  });
+
+  it("hoppar över frågan om pass 2 redan flaggat samma nyckeltal", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktionMed("skuldsattning_per_m2_brf_yta", {
+        value: null,
+        unit: "kr/m2",
+        source: "berakning",
+      }),
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: {
+        ...analysJudgement,
+        rodaFlaggor: [
+          {
+            id: "skuld-saknas",
+            titel: "Skuldsättningen går inte att bedöma",
+            beskrivning: "Uppgiften saknas.",
+            severity: "lag",
+            harledsFran: ["skuldsattning_per_m2_brf_yta"],
+          },
+        ],
+      },
+    });
+
+    expect(resultat.fragor.some((f) => f.id === "saknar-skuldsattning-per-m2")).toBe(false);
+  });
+
+  it("rör aldrig värderingsfälten: externVardering, avvikelse och slutsats är identiska med byggPrisanalys", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new ModellPrisdatakalla(),
+      analys: analysJudgement,
+    });
+    const utanBrf = await byggPrisanalys(inputKomplett, new ModellPrisdatakalla());
+
+    expect(resultat.prisanalys.andelAvForeningensSkuld?.value).toBe(694_400);
+    // The BRF layer (debt share comment, fee-rise adjustment) is added on top
+    // as separate fields; the shared core's own fields stay identical.
+    const {
+      andelAvForeningensSkuld: _skuld,
+      justeringar: _j,
+      justeradVardering: _jv,
+      avvikelseMotJusteradVardering: _ajv,
+      breddningsskal: _b,
+      slutsats: justeradSlutsats,
+      ...rest
+    } = resultat.prisanalys;
+    const { slutsats: _bas, ...utanBrfRest } = utanBrf;
+    expect(rest).toEqual(utanBrfRest);
+    // With an adjusted value the conclusion compares only with it (2026-10-26).
+    expect(justeradSlutsats).toContain("värdet med hänsyn till föreningens ekonomi");
+    expect(justeradSlutsats).not.toMatch(/90-procentiga|attraktivt/);
+  });
+});
+
+describe("avgiftskontrollen (D6) — månadsavgiften mot föreningens årsavgift per m²", () => {
+  // Fixturen: 780 kr/m²/år × 62 m² / 12 = 4 030 kr/mån förväntat.
+  const forening = extraktion.forening;
+
+  it("ingen fråga inom 15 % (4 200 kr mot 4 030 kr, +4,2 %)", () => {
+    expect(avgiftsavvikelseFraga({ manadsavgift: 4200, boarea: 62 }, forening)).toBeNull();
+  });
+
+  it("ingen fråga precis på gränsen (4 634,5 kr = +15 %)", () => {
+    expect(avgiftsavvikelseFraga({ manadsavgift: 4634.5, boarea: 62 }, forening)).toBeNull();
+  });
+
+  it("fråga över gränsen, med båda beloppen i kronor och nyckeltalets ref", () => {
+    const fraga = avgiftsavvikelseFraga({ manadsavgift: 4700, boarea: 62 }, forening);
+    expect(fraga).toMatchObject({
+      id: "avgift-avviker-fran-foreningen",
+      ursprung: "analys",
+      riktadTill: "maklaren",
+      ref: { page: 8 },
+    });
+    expect(fraga?.varfor).toMatch(/4\s030 kr/);
+    expect(fraga?.varfor).toMatch(/4\s700 kr/);
+    expect(fraga?.varfor).toMatch(/16,6 % högre/);
+    expect(fraga?.varfor).toMatch(/andelstal/);
+  });
+
+  it("en höjning som redan gäller: jämför med den höjda nivån (4 030 × 1,25 = 5 038), ingen fråga för 5 038 kr", () => {
+    expect(
+      avgiftsavvikelseFraga({ manadsavgift: 5038, boarea: 62 }, forening, {
+        faktor: 1.25,
+        procent: [25],
+      }),
+    ).toBeNull();
+  });
+
+  it("en höjning som redan gäller: fråga när avgiften ändå avviker, med båda nivåerna i texten", () => {
+    const fraga = avgiftsavvikelseFraga({ manadsavgift: 6000, boarea: 62 }, forening, {
+      faktor: 1.25,
+      procent: [25],
+    });
+    expect(fraga?.varfor).toMatch(
+      /4\s030 kr i månaden, eller ungefär 5\s038 kr efter den beslutade höjningen på 25 % som redan gäller/,
+    );
+    expect(fraga?.varfor).toMatch(/19,1 % högre/);
+  });
+
+  it("fråga även när avgiften är mycket lägre än föreningens snitt", () => {
+    const fraga = avgiftsavvikelseFraga({ manadsavgift: 3000, boarea: 62 }, forening);
+    expect(fraga?.varfor).toMatch(/25,6 % lägre/);
+  });
+
+  it("ingen fråga när årsavgiften per m² saknas", () => {
+    const { forening: utan } = extraktionMed("arsavgift_per_m2_brf_yta", {
+      value: null,
+      unit: "kr/m2",
+      source: "arsredovisning",
+    });
+    expect(avgiftsavvikelseFraga({ manadsavgift: 9000, boarea: 62 }, utan)).toBeNull();
+  });
+
+  it("ingen fråga när månadsavgiften eller boarean saknas (0)", () => {
+    expect(avgiftsavvikelseFraga({ manadsavgift: 0, boarea: 62 }, forening)).toBeNull();
+    expect(avgiftsavvikelseFraga({ manadsavgift: 4200, boarea: 0 }, forening)).toBeNull();
+  });
+
+  it("läggs till bland frågorna i den monterade analysen", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: { ...inputKomplett, manadsavgift: 5500 },
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+    expect(resultat.fragor.filter((f) => f.id === "avgift-avviker-fran-foreningen")).toHaveLength(
+      1,
+    );
+    expect(AnalysisResultSchema.safeParse(resultat).success).toBe(true);
+  });
+});
+
+describe("utan utgångspris (valfritt)", () => {
+  const { utgangspris: _u, ...inputUtanPris } = inputKomplett;
+
+  it("assembleraAnalys utelämnar prisfälten och avvikelserna men behåller värderingen och skuldandelen", async () => {
+    const resultat = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputUtanPris,
+      prisdatakalla: new ModellPrisdatakalla(),
+      analys: analysJudgement,
+    });
+    const p = resultat.prisanalys;
+    expect("utgangspris" in p).toBe(false);
+    expect("prisPerM2" in p).toBe(false);
+    expect("avvikelseMotVardering" in p).toBe(false);
+    expect("avvikelseMotForeningen" in p).toBe(false);
+    expect(p.slutsats).toContain("Inget utgångspris");
+    expect(p.externVardering).toBeDefined();
+    expect(p.andelAvForeningensSkuld?.value).toBe(694_400);
+    expect(AnalysisResultSchema.safeParse(resultat).success).toBe(true);
+  });
+
+  it("byggPrisanalys utan pris och utan oberoende data (fall C) nämner aldrig utgångspriset som om det fanns", async () => {
+    const p = await byggPrisanalys(inputUtanPris, new TomPrisdatakalla());
+    expect(p.slutsats).toContain("Inget utgångspris har angetts");
+    expect(p.slutsats).not.toContain("det angivna utgångspriset");
+    expect(JSON.stringify(p.konfidens)).not.toContain("Utgångspriset har inte");
+  });
+
+  it("tillPrisInput utelämnar utgangspris-nyckeln", () => {
+    expect("utgangspris" in tillPrisInput(inputUtanPris)).toBe(false);
+  });
+});
+
+describe("tillPrisInput", () => {
+  it("plockar ut exakt värderingsdelmängden av PropertyInput", () => {
+    expect(tillPrisInput(inputKomplett)).toEqual({
+      boarea: 62,
+      antalRum: 3,
+      manadsavgift: 4200,
+      postnummer: "11857",
+      vaning: 3,
+      byggar: 1962,
+      hiss: "ja",
+      balkong: "nej",
+      utgangspris: 4_950_000,
+    });
+  });
+
+  it("utelämnar vaning/byggar när de saknas (inga undefined-nycklar)", () => {
+    const { vaning: _v, byggar: _b, ...utan } = inputKomplett;
+    const prisInput = tillPrisInput(utan);
+    expect("vaning" in prisInput).toBe(false);
+    expect("byggar" in prisInput).toBe(false);
+  });
+});
+
+describe("osäkra nyckeltal — en bekräftelsefråga till styrelsen per markerad siffra", () => {
+  const OSAKER =
+    "Räntekänsligheten 9 % stämmer inte med räntebärande skulder delat med årsavgifter, som ger 6,47 %.";
+
+  function medOsaker(id: KeyFigureId, text: string): ExtractionResult {
+    const kf = extraktion.forening.keyFigures.find((k) => k.id === id)!;
+    return extraktionMed(id, { ...kf.figure, osaker: text });
+  }
+
+  const kor = (extraction: ExtractionResult, analys: AnalysJudgement = analysJudgement) =>
+    assembleraAnalys({
+      extraction,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys,
+    });
+
+  it("lägger till en deterministisk fråga (ursprung 'analys', styrelsen) med orsaken i varfor", async () => {
+    const resultat = await kor(medOsaker("rantekanslighet", OSAKER));
+    const fraga = resultat.fragor.find((f) => f.id === "osaker-rantekanslighet");
+    expect(fraga).toBeDefined();
+    expect(fraga!.ursprung).toBe("analys");
+    expect(fraga!.riktadTill).toBe("styrelsen");
+    expect(fraga!.fraga).toMatch(/räntekänslighet/i);
+    expect(fraga!.fraga).toMatch(/bekräfta/i);
+    expect(fraga!.varfor).toContain(OSAKER);
+  });
+
+  it("ger ingen fråga när ingen siffra är markerad osäker", async () => {
+    const resultat = await kor(extraktion);
+    expect(resultat.fragor.some((f) => f.id.startsWith("osaker-"))).toBe(false);
+  });
+
+  it("en fråga per markerad siffra", async () => {
+    const a = medOsaker("rantekanslighet", OSAKER);
+    const kf = a.forening.keyFigures.find((k) => k.id === "arsavgift_per_m2_brf_yta")!;
+    const bada = extraktionMed("arsavgift_per_m2_brf_yta", { ...kf.figure, osaker: "Orsak två." });
+    // slå ihop: räntekänslighet osäker + årsavgift osäker
+    const extraction: ExtractionResult = {
+      ...a,
+      forening: {
+        ...a.forening,
+        keyFigures: a.forening.keyFigures.map((k) =>
+          k.id === "arsavgift_per_m2_brf_yta"
+            ? bada.forening.keyFigures.find((x) => x.id === k.id)!
+            : k,
+        ),
+      },
+    };
+    const resultat = await kor(extraction);
+    expect(
+      resultat.fragor
+        .filter((f) => f.id.startsWith("osaker-"))
+        .map((f) => f.id)
+        .sort(),
+    ).toEqual(["osaker-arsavgift_per_m2_brf_yta", "osaker-rantekanslighet"]);
+  });
+
+  it("dedupar mot en fråga som redan nämner nyckeltalet", async () => {
+    const resultat = await kor(medOsaker("rantekanslighet", OSAKER), {
+      ...analysJudgement,
+      fragor: [
+        ...analysJudgement.fragor,
+        {
+          id: "fraga-rk",
+          fraga: "Kan styrelsen bekräfta föreningens räntekänslighet?",
+          ursprung: "analys",
+          riktadTill: "styrelsen",
+          varfor: "x",
+        },
+      ],
+    });
+    expect(resultat.fragor.some((f) => f.id === "osaker-rantekanslighet")).toBe(false);
+    expect(resultat.fragor.filter((f) => /räntekänslighet/i.test(f.fraga))).toHaveLength(1);
+  });
+
+  it("figuren behålls och visas: osaker följer med i forening", async () => {
+    const resultat = await kor(medOsaker("rantekanslighet", OSAKER));
+    expect(
+      resultat.forening.keyFigures.find((k) => k.id === "rantekanslighet")!.figure.osaker,
+    ).toBe(OSAKER);
+  });
+
+  it("resultatet validerar mot AnalysisResultSchema", async () => {
+    const resultat = await kor(medOsaker("rantekanslighet", OSAKER));
+    expect(AnalysisResultSchema.safeParse(resultat).success).toBe(true);
+  });
+});
+
+describe("datakvalitet.kalla följer med från extraktionen", () => {
+  it("kopieras till AnalysisResult.datakvalitet när den finns, utelämnas annars", async () => {
+    const skannad: ExtractionResult = {
+      ...extraktion,
+      datakvalitet: { ...extraktion.datakvalitet, kalla: "skannad" },
+    };
+    const med = await assembleraAnalys({
+      extraction: skannad,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+    expect(med.datakvalitet.kalla).toBe("skannad");
+
+    const utan = await assembleraAnalys({
+      extraction: extraktion,
+      input: inputKomplett,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: analysJudgement,
+    });
+    expect("kalla" in utan.datakvalitet).toBe(false);
+  });
+});
+
+describe("deterministiska frågor — varför-texten säger vad svaret betyder för köparen", () => {
+  // Utan flaggan som handlar om ett känt räntekänslighetstal, annars skymmer
+  // dedup-kontrollen de deterministiska frågorna.
+  const kor = (extraction: ExtractionResult, input: PropertyInput = inputKomplett) =>
+    assembleraAnalys({
+      extraction,
+      input,
+      prisdatakalla: new TomPrisdatakalla(),
+      analys: { ...analysJudgement, rodaFlaggor: [] },
+    });
+
+  it("saknad uppgift (hiss, balkong, avgiftsposter): varför nämner pris/värde eller månadskostnad och svarssignal är utelämnad eller ifylld", async () => {
+    const resultat = await kor(extraktion, inputAllaOkanda);
+    const saknade = resultat.fragor.filter((f) => f.ursprung === "saknad_uppgift");
+    expect(saknade.length).toBe(5);
+    for (const f of saknade) {
+      expect(f.varfor).toMatch(/pris|värde|månadskostnad|budet/i);
+      if ("svarssignal" in f) expect(f.svarssignal!.trim().length).toBeGreaterThan(0);
+    }
+    expect(AnalysisResultSchema.safeParse(resultat).success).toBe(true);
+  });
+
+  it("saknad räntekänslighet: varför förklarar följden för avgiften vid ränteuppgång, svarssignal utan siffror", async () => {
+    const resultat = await kor(extraktionUtanRantekanslighet());
+    const fraga = resultat.fragor.find((f) => f.id === "saknar-rantekanslighet")!;
+    expect(fraga.varfor).toMatch(/månadsavgift|avgiften/i);
+    expect(fraga.varfor).toMatch(/ränta/i);
+    expect(fraga.varfor).toMatch(/svar|utan/i);
+    expect(fraga.svarssignal).toMatch(/Bra svar:.*Varningssignal:/);
+    expect(fraga.svarssignal).not.toMatch(/\d/);
+    expect(AnalysisResultSchema.safeParse(resultat).success).toBe(true);
+  });
+
+  it("saknad skuld per m²: varför säger vad svaret säger om lånen i köparens avgift", async () => {
+    const resultat = await kor(
+      extraktionMed("skuldsattning_per_m2_brf_yta", {
+        value: null,
+        unit: "kr/m2",
+        source: "berakning",
+      }),
+    );
+    const fraga = resultat.fragor.find((f) => f.id === "saknar-skuldsattning-per-m2")!;
+    expect(fraga.varfor).toMatch(/månadsavgift/i);
+    expect(fraga.varfor).toMatch(/lägenheten bär/);
+  });
+
+  it("avgiftsavvikelse: varför säger vad svaret avgör för köparens månadskostnad, utan nya siffror", () => {
+    const forening = extraktion.forening;
+    const fraga = avgiftsavvikelseFraga({ manadsavgift: 4700, boarea: 62 }, forening);
+    expect(fraga?.varfor).toMatch(/månadskostnad|budget/i);
+    expect(fraga?.svarssignal).toMatch(/Bra svar:.*Varningssignal:/);
+    expect(fraga?.svarssignal).not.toMatch(/\d/);
+  });
+
+  it("osäker siffra: varför behåller orsaken och säger vad bekräftelsen betyder för köparen", async () => {
+    const kf = extraktion.forening.keyFigures.find((k) => k.id === "rantekanslighet")!;
+    const orsak = "Räntekänsligheten 9 % stämmer inte med skulderna, som ger 6,47 %.";
+    const forening: Forening = {
+      ...extraktion.forening,
+      keyFigures: extraktion.forening.keyFigures.map((k) =>
+        k.id === "rantekanslighet" ? { ...kf, figure: { ...kf.figure, osaker: orsak } } : k,
+      ),
+    };
+    const resultat = await kor({ ...extraktion, forening });
+    const fraga = resultat.fragor.find((f) => f.id === "osaker-rantekanslighet")!;
+    expect(fraga.varfor).toContain(orsak);
+    expect(fraga.varfor).toMatch(/lita på|avgiften|bedöm/i);
+    expect(fraga.svarssignal).toMatch(/Bra svar:.*Varningssignal:/);
+    expect(AnalysisResultSchema.safeParse(resultat).success).toBe(true);
+  });
+});
+
+describe("flaggarBaraOmSaknatByggar (round 2026-10-26)", () => {
+  it("matches a flag whose opening sentence says byggår is missing", () => {
+    expect(
+      flaggarBaraOmSaknatByggar({
+        titel: "Husets ålder framgår inte",
+        beskrivning:
+          "Byggår eller värdeår saknas i underlaget, så det går inte att bedöma hur gammalt huset är. Energikostnaden är 238 kr.",
+      }),
+    ).toBe(true);
+  });
+  it("keeps a flag that only mentions it later", () => {
+    expect(
+      flaggarBaraOmSaknatByggar({
+        titel: "Energikostnaden ligger över riksgenomsnittet",
+        beskrivning: "Energikostnaden är 238 kr per m². Byggår saknas i underlaget.",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("utanByggarSaknasMeningar (round 2026-10-26)", () => {
+  it("drops only the sentence that says byggår is missing", () => {
+    const f = utanByggarSaknasMeningar({
+      id: "energi",
+      titel: "Energikostnaden ligger över riktvärdet",
+      beskrivning:
+        "Energikostnaden är 238 kr per kvadratmeter. Byggåret saknas i underlaget, så det går inte att säga om husets ålder förklarar nivån.",
+      severity: "lag",
+      harledsFran: ["energikostnad_per_m2_totalyta"],
+    } as unknown as RedFlag);
+    expect(f.beskrivning).toBe("Energikostnaden är 238 kr per kvadratmeter.");
+  });
+});

@@ -1,0 +1,106 @@
+{
+  "orgnr": "769624-6953",
+  "namn": "Brf Barsbro Parken",
+  "kalla": {
+    "fil": "test_rapport.pdf",
+    "forvaltare": "SBC (avtal med leverantörer, sida 7)",
+    "verifieradMot": "Verifierad av ägaren: identitet, avgiftsinkludering och övrig info 2026-09-25; nyckeltalsvärdena 2026-10-10 (avlästa av supervisorn från den renderade sidbilden, PDF-sida 8, tryckt 'Sida 6 av 20', eftersom textlagret i flerårsöversiktens tabell är garblat — se pdf.ts:bedomTextkvalitet, 0,785)."
+  },
+  "nyckeltal": {
+    "arsavgift_per_m2_brf_yta": 724,
+    "arsavgift_andel_av_rorelseintakter": 65.9,
+    "skuldsattning_per_m2_totalyta": 4424,
+    "skuldsattning_per_m2_brf_yta": 5329,
+    "sparande_per_m2_totalyta": 138,
+    "rantekanslighet": 7.36,
+    "energikostnad_per_m2_totalyta": 247
+  },
+  "verifiering": {
+    "arsavgift_per_m2_brf_yta": {
+      "anmarkning": "Går INTE att läsa säkert. Sida 8 (tryckt \"Sida 6 av 20\"), raden \"Årsavgift 1 kvm upplåten bostadsrätt, kr 7 2 4 6 8 6 6 3 7 -\" ska täcka fyra kolumner (2025 2024 2023 2022) men siffrorna extraheras som nio lösryckta ensiffriga tokens plus ett bindestreck, utan säker kolumngräns — t.ex. kan \"7 2 4\" lika gärna vara \"724\" som \"7\" på ett annat ställe i tabellen. Ingen siffra antagen."
+    },
+    "arsavgift_andel_av_rorelseintakter": {
+      "anmarkning": "Går INTE att läsa säkert. Sida 8, raden \"Årsavgifternas andel av totala 6 5 , 9 6 7 3 6 7 0 -\" har samma garblingsproblem som ovan."
+    },
+    "skuldsattning_per_m2_totalyta": {
+      "anmarkning": "Går INTE att läsa säkert. Sida 8, raden \"Skuldsättning 1 kvm totalyta, kr 4 4 2 4 4 2 4 7 4 2 4 7 4 0 5 4\" — samma garblingsproblem."
+    },
+    "skuldsattning_per_m2_brf_yta": {
+      "anmarkning": "Går INTE att läsa säkert. Sida 8, raden \"Skuldsättning 1 kvm upplåten bostadsrätt, 3 2 9 5 0 9 6 5 0 9 6 5 3 0 8\" — samma garblingsproblem."
+    },
+    "sparande_per_m2_totalyta": {
+      "anmarkning": "Går INTE att läsa säkert. Sida 8, raden \"Sparande 1 kvm totalyta, kr 1 3 8 1 5 8 7 1 2 9\" — samma garblingsproblem."
+    },
+    "rantekanslighet": {
+      "anmarkning": "Går INTE att läsa säkert — men det HÄR fältet är den exakta uppgiften nämnd i uppgiftsbeskrivningen: sida 8, raden \"Räntekänslighet (%) 7,36 7 , 4 3 8 , 0 0 -\". Första talet (\"7,36\") råkar vara helt läsbart (2025), men det andra (2024) är exakt \"7 , 4 3 8 , 0 0\" — omöjligt att med säkerhet avgöra om det är \"7,43\" eller något annat, eftersom kommatecken och siffror är utspridda som egna tokens. Ingen siffra antagen för 2024 eller senare kolumner."
+    },
+    "energikostnad_per_m2_totalyta": {
+      "anmarkning": "Går INTE att läsa säkert. Sida 8, raden \"Energikostnad / kvm totolyto, kr 2 4 7 2 6 9 2 2 6 1 9 6\" — samma garblingsproblem."
+    },
+    "avgiftInkluderar.bredband": {
+      "sida": 14,
+      "tryckt": "\"1 årsavgiften ingår kostnaderför bredband, vatten och värme.\" (NOT 1, löpande text — INTE i den garblade tabellen, tillförlitligt läsbar)."
+    },
+    "avgiftInkluderar.vatten": {
+      "sida": 14,
+      "tryckt": "Samma mening som bredband ovan."
+    },
+    "avgiftInkluderar.varme": {
+      "sida": 14,
+      "tryckt": "Samma mening som bredband ovan."
+    },
+    "avgiftInkluderar.el": {
+      "sida": 8,
+      "tryckt": "\"Kostnader för medlemmarnas elförbrukning ingår inte i årsavgiften.\" (nyckeltalens förklaringstext, löpande, INTE i den garblade tabellen)."
+    }
+  },
+  "avgiftInkluderar": {
+    "bredband": "ja",
+    "vatten": "ja",
+    "varme": "ja",
+    "el": "nej"
+  },
+  "ovrigInfo": {
+    "antalMedlemmar": 227,
+    "antalHyresratter": 14,
+    "antalLokaler": 15,
+    "avgiftInkluderarKallor": {
+      "bredband": 14,
+      "vatten": 14,
+      "varme": 14,
+      "el": 8
+    }
+  },
+  "ovrigInfoVerifierad": true,
+  "ovrigInfoVerifiering": {
+    "antalMedlemmar": {
+      "sida": 7,
+      "tryckt": "\"Vid räkenskapsårets slutfanns det 227 medlemmar i föreningen.\" (löpande text, tillförlitligt läsbar trots att OCR:en klistrat ihop \"slut\" och \"fanns\")."
+    },
+    "antalHyresratter": {
+      "sida": 4,
+      "tryckt": "\"Föreningen har 14 hyreslägenheter och 167 bostadsrätter om totalt 10 272 kvm och 15 lokaler om 1 031 kvm.\" (löpande text, tillförlitligt läsbar — INTE i den garblade flerårsöversikten)."
+    },
+    "antalLokaler": {
+      "sida": 4,
+      "tryckt": "Samma mening som antalHyresratter ovan."
+    },
+    "avgiftInkluderarKallor.bredband": {
+      "sida": 14,
+      "tryckt": "Samma citat som avgiftInkluderar.bredband ovan (\"1 årsavgiften ingår kostnaderför bredband, vatten och värme.\")."
+    },
+    "avgiftInkluderarKallor.vatten": {
+      "sida": 14,
+      "tryckt": "Samma mening som bredband ovan."
+    },
+    "avgiftInkluderarKallor.varme": {
+      "sida": 14,
+      "tryckt": "Samma mening som bredband ovan."
+    },
+    "avgiftInkluderarKallor.el": {
+      "sida": 8,
+      "tryckt": "Samma citat som avgiftInkluderar.el ovan."
+    }
+  },
+  "nyckeltalSida": 8
+}

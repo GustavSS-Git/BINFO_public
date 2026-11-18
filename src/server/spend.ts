@@ -1,0 +1,193 @@
+/**
+ * Spend-vakten: reserve-then-reconcile, inte check-then-increment.
+ *
+ * Varje pipeline-steg som anropar Anthropic-API:et MÅSTE gå via
+ * `reserveraForSteg` INNAN anropet görs (så att det dagliga taket hålls
+ * atomärt även när flera steg körs samtidigt) och `stamAvSteg` EFTER att
+ * anropet är klart (så att reservationen justeras ner — eller upp — till
+ * den faktiska kostnaden).
+ *
+ * Atomiciteten kommer inte från något i den här filen: `db.reserveraSpend`
+ * lägger hela avgörandet "får dagens totalsumma + den här reservationen
+ * plats under taket?" i en enda databas-rundtur (se `reservera_spend` i
+ * supabase/migrations/20260913105304_init.sql, och motsvarande fake i
+ * __fakes__/lager.ts). Den här modulen läser aldrig dagens totalsumma själv
+ * och beslutar client-side — det vore precis den check-then-act-race som
+ * designen ska undvika. Vi skickar bara vidare uppskattningen och agerar på
+ * svaret.
+ *
+ * `ANALYSIS_KILL_SWITCH=on` (env.killSwitchPa) refuserar INNAN någon
+ * reservation ens försöks — ett avstängt system ska inte röra `spend_day`
+ * alls, inte ens läsa/skriva en no-op-rad.
+ */
+
+import type { Databas } from "./portar";
+import type { Env } from "./env";
+import { MAX_SIDOR_SKANNAD_RAPPORT } from "./register";
+
+export type SpendSkal = "daily_cap" | "kill_switch";
+
+export interface SpendResultat {
+  ok: boolean;
+  skal?: SpendSkal;
+  reserveratSek?: number;
+}
+
+/**
+ * Uppskattade kostnader per pipeline-steg, i SEK — avsiktligt avrundade
+ * UPPÅT (ett steg ska reservera minst så mycket som det troligen kostar,
+ * aldrig mindre). Källa: uppmätt kall körning mot Nabo-rapporten
+ * (september 2026; tabellen stod i GOLIVE.md, nu borttagen — se git-historiken):
+ *
+ *   | Pass 1 — extraction (sends the whole PDF) | 3,27 kr |
+ *   | Pass 2 — judgement (text only)             | 0,64 kr |
+ *
+ * Pass 1 görs i sin tur av två separata API-anrop — grundning (skickar hela
+ * PDF:en, se `grundtext`-fältet på `AnalysRad` i portar.ts) och därefter
+ * extraktion (resonerar bara över grundtexten, text only). Mätningen skiljer
+ * inte ut den interna fördelningen mellan de två, men grundning är
+ * steget som bär hela dokumentet genom modellen och antas därför dominera
+ * pass 1:s kostnad; extraktion är billigare. Bedömning (Pass 2) mäts direkt
+ * till 0,64 kr och avrundas uppåt till 1,5 kr för marginal.
+ */
+export const UPPSKATTAD_KOSTNAD_GRUNDNING_SEK = 3;
+export const UPPSKATTAD_KOSTNAD_EXTRAKTION_SEK = 1;
+export const UPPSKATTAD_KOSTNAD_BEDOMNING_SEK = 1.5;
+
+/**
+ * Transkribering av en skannad rapport: kostnaden
+ * växer med sidantalet, så reservationen görs per sida.
+ *
+ * Reservationen är avsiktligt REALISTISK, inte värsta fallet: uppmätt
+ * 0,105 kr/sida inkl. headers (Sonnet 5.5, effort medium, 5-sidors chunkar;
+ * prislista $2/$10 per Mtok, 9,7 kr/USD, costGuard.ts) → 0,15 kr/sida ger ca
+ * 40 % marginal. Värsta fallet per chunk (8,6k in + 8k ut = ~0,94 kr) skulle
+ * för en 34-sidig rapport reservera ~6,6 kr mot en verklig kostnad på ~3,6 kr
+ * och blockera onödigt mycket av dagens tak. Reservationen stäms av mot den
+ * faktiska kostnaden efter steget, som för alla steg.
+ */
+export const UPPSKATTAD_KOSTNAD_TRANSKRIBERING_SEK_PER_SIDA = 0.15;
+
+/** `max_tokens` per chunk. Uppmätt maximum 5,1k (tänkande inräknat) för 5 sidor;
+ *  10 000 ger knappt 2x marginal och håller värsta fallet för
+ *  MAX_SIDOR_SKANNAD_RAPPORT (60 sidor = 12 chunkar) under stegets tak:
+ *  ≈1,14 kr per chunk vid 8,6k in-tokens → ≈13,6 kr < 15 kr. Värsta fallet
+ *  räknas i `transkribera` ur chunkens verkliga `countTokens` (prislista i
+ *  costGuard.ts). Med 12 000 nåddes 60 sidor aldrig (≈16 kr > 15 kr). */
+export const TRANSKRIBERING_MAX_OUTPUT_TOKENS_PER_CHUNK = 10_000;
+
+/**
+ * Hårt tak för HELA transkriberingssteget, oberoende av antalet chunkar —
+ * PRODUKTBESLUT (supervisor 2026-10-09), inte ett uppmätt värde: 0,25 kr per
+ * tillåten sida (uppmätt kostnad är 0,105 kr/sida, alltså drygt 2x marginal) gånger
+ * MAX_SIDOR_SKANNAD_RAPPORT = 15 kr. Gäller summan av spenderat över ALLA
+ * försök (`rapport.cost_sek`) och är den övre gränsen som ges till
+ * `transkribera` (vars förhandskontroll summerar värsta fallet för alla
+ * parallella chunkar). OBS: vid 12 000 max_tokens är värsta fallet ≈1,33 kr per
+ * chunk, så förhandskontrollen släpper igenom högst ca 55 sidor vid 8,6k
+ * in-tokens per chunk (11 × 1,33 = 14,6 kr) — se rapporten.
+ */
+export const MAX_TRANSKRIBERING_SEK = MAX_SIDOR_SKANNAD_RAPPORT * 0.25;
+
+/**
+ * Högst så här många chunkar (5 sidor var) transkriberas per Edge-invokering.
+ * Edge Functions har en hård CPU-gräns på 2 s (mjuk 1 s) per invokering. MÄTT i en
+ * lokal Supabase-stack (edge-runtime 1.74.3, 2026-10-10, 34-sidig skanning): en
+ * invokering med 4 chunkar loggade "CPU time soft limit reached" (och tidigare 7
+ * chunkar likaså); en med 3 chunkar gjorde det inte. Förberedelsen utan själva
+ * modellanropen (dela PDF:en, base64, countTokens) loggade ingen gräns — kostnaden
+ * ligger i att skicka/ta emot de stora anropen, och växer med antalet chunkar.
+ * Tre chunkar (15 sidor) per invokering ger marginal under den mjuka gränsen;
+ * resten tas av nästa invokering (reinvoke, ~1 s mellan). Värdet är en mätt
+ * säkerhetsmarginal, inte gränsen själv. Förhandskontrollen av värsta fallet
+ * gäller därför bara invokeringens egna chunkar.
+ */
+export const MAX_CHUNKAR_PER_ANROP = 3;
+
+/** Reservation för att transkribera `antalSidor` sidor (0 sidor = 0 kr). */
+export function uppskattadKostnadTranskribering(antalSidor: number): number {
+  return antalSidor * UPPSKATTAD_KOSTNAD_TRANSKRIBERING_SEK_PER_SIDA;
+}
+
+/** Det som återstår av stegets hårda tak, givet vad rapporten redan kostat
+ *  (`rapport.cost_sek`, alla försök). 0 när taket är nått. */
+export function transkriberingsTak(redanSpenderatSek: number): number {
+  return Math.max(0, MAX_TRANSKRIBERING_SEK - redanSpenderatSek);
+}
+
+/**
+ * Dagens datum som "YYYY-MM-DD", i Europe/Stockholm — inte UTC. Ett
+ * medvetet men lågstakes-val: köparna och spendet hör hemma i svensk tid,
+ * så dygnsgränsen för det dagliga taket ska följa den, inte UTC (som annars
+ * skulle flytta gränsen 1–2 timmar fel beroende på sommar-/vintertid). Går
+ * att ompröva senare om systemet får köpare i andra tidszoner.
+ */
+function dagensDatumStockholm(): string {
+  // "en-CA" råkar formatera som YYYY-MM-DD, men det avgörande valet här är
+  // timeZone — inte lokalen.
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Stockholm",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+/**
+ * Försöker reservera `uppskattatSek` av dagens spend-tak INNAN ett steg
+ * anropar Anthropic-API:et. Se filkommentaren för varför det här är säkert
+ * mot race conditions.
+ */
+export async function reserveraForSteg(
+  db: Databas,
+  env: Pick<Env, "maxDailySpendSek" | "killSwitchPa">,
+  uppskattatSek: number,
+  dag: string = dagensDatumStockholm(),
+): Promise<SpendResultat> {
+  if (env.killSwitchPa) {
+    return { ok: false, skal: "kill_switch" };
+  }
+
+  const accepterad = await db.reserveraSpend(dag, uppskattatSek, env.maxDailySpendSek);
+  if (!accepterad) {
+    return { ok: false, skal: "daily_cap" };
+  }
+  return { ok: true, reserveratSek: uppskattatSek };
+}
+
+/**
+ * Stämmer av en tidigare reservation mot den faktiska kostnaden efter att
+ * steget är klart — frigör mellanskillnaden om den faktiska kostnaden blev
+ * lägre, eller drar av mer om den blev högre.
+ */
+export async function stamAvSteg(
+  db: Databas,
+  reserveratSek: number,
+  faktisktSek: number,
+  dag: string = dagensDatumStockholm(),
+): Promise<void> {
+  await db.avstamSpend(dag, reserveratSek, faktisktSek);
+}
+
+/**
+ * Upfront, READ-ONLY check at upload (`skapaAnalys`): is today's spend
+ * already at or over the daily cap? Then a new analysis would only sit in the
+ * queue until tomorrow (the tick refuses to reserve, see `reserveraForSteg`),
+ * so the buyer is told now instead.
+ *
+ * Reserves nothing and decides nothing about any API call — that stays the
+ * atomic `reserveraForSteg` before every step. A read that races a concurrent
+ * reservation can only let an upload through that the tick then queues,
+ * which is exactly the behaviour without this check.
+ */
+export async function kontrolleraDagligtTak(
+  db: Databas,
+  env: Pick<Env, "maxDailySpendSek">,
+  dag: string = dagensDatumStockholm(),
+): Promise<SpendResultat> {
+  const idag = await db.hamtaSpendForDag(dag);
+  if (idag >= env.maxDailySpendSek) {
+    return { ok: false, skal: "daily_cap" };
+  }
+  return { ok: true };
+}

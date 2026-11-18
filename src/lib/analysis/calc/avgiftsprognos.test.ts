@@ -1,0 +1,1799 @@
+import { describe, expect, it } from "vitest";
+import type {
+  Avgiftsandring,
+  AvgiftsKomponentId,
+  Figure,
+  Forening,
+  KeyFigure,
+  Kontrollsummor,
+  Lan,
+  Referensranta,
+} from "@/types/analysis";
+import {
+  beraknaAvgiftsprognos,
+  laggTillManader,
+  tryckFor,
+  type AvgiftsprognosInput,
+} from "./avgiftsprognos";
+
+// All amounts below are worked out by hand in the comments.
+// Default: månadsavgift 4 000 kr, årsavgifter 4 800 000 kr → andel = 48 000 / 4 800 000 = 0,01,
+// so a BRF cost of X kr/year is X × 0,01 ÷ 12 = X / 1 200 kr/month for the flat.
+// Reference rate 2,068 % + margin 0,58 = new rate 2,648 %.
+
+const REF: Referensranta = {
+  namn: "3-månaders statsskuldväxel",
+  serie: "SETB3MBENCH",
+  datum: "2026-10-23",
+  procent: 2.068,
+  kalla: "Sveriges riksbank",
+  reserv: false,
+};
+const IDAG = "2026-10-24"; // horizon end 2028-10-24
+
+const fig = (value: number | null, extra: Partial<Figure> = {}): Figure => ({
+  value,
+  unit: "kr",
+  source: "arsredovisning",
+  ref: { page: 5, excerpt: "x" },
+  ...extra,
+});
+
+const sparande = (v: number | null, extra: Partial<Figure> = {}): KeyFigure => ({
+  id: "sparande_per_m2_totalyta",
+  label: "Sparande",
+  figure: fig(v, { unit: "kr/m2", ...extra }),
+  status: "okant",
+  forklaring: "",
+});
+const rk = (v: number | null): KeyFigure => ({
+  id: "rantekanslighet",
+  label: "Räntekänslighet",
+  figure: fig(v, { unit: "procent" }),
+  status: "okant",
+  forklaring: "",
+});
+
+function forening(extra: Partial<Forening> = {}): Forening {
+  return {
+    namn: "Brf Test",
+    orgnr: "769600-0000",
+    akta: "ja",
+    rakenskapsar: 2025,
+    keyFigures: [],
+    ...extra,
+  };
+}
+
+const KS: Kontrollsummor = { arsavgifter: fig(4_800_000) };
+
+function kor(f: Forening, extra: Partial<AvgiftsprognosInput> = {}) {
+  return beraknaAvgiftsprognos({
+    forening: f,
+    kontrollsummor: KS,
+    manadsavgift: 4000,
+    boarea: 50,
+    referensranta: REF,
+    idag: IDAG,
+    ...extra,
+  });
+}
+function komp(r: ReturnType<typeof kor>, id: AvgiftsKomponentId) {
+  const k = r.prognos.komponenter.find((c) => c.id === id);
+  if (!k) throw new Error("missing component " + id);
+  return k;
+}
+const lan = (
+  belopp: number,
+  ranta: number | null,
+  dag: string | undefined,
+  rantetyp: Lan["rantetyp"] = "okant",
+): Lan => ({
+  belopp: fig(belopp),
+  ...(ranta !== null ? { ranta: fig(ranta, { unit: "procent" }) } : {}),
+  ...(dag ? { villkorsandringsdag: dag } : {}),
+  rantetyp,
+  ref: { page: 9, excerpt: "lån" },
+});
+const lanebok = (totalSkuld: number, lanLista?: Lan[], extra: object = {}) => ({
+  lanebok: { totalSkuld: fig(totalSkuld), ...(lanLista ? { lan: lanLista } : {}), ...extra },
+});
+
+describe("laggTillManader", () => {
+  it("adds months and clamps the day", () => {
+    expect(laggTillManader("2026-10-24", 24)).toBe("2028-10-24");
+    expect(laggTillManader("2026-01-31", 1)).toBe("2026-02-28");
+    expect(laggTillManader("2026-11-30", 3)).toBe("2027-02-28");
+  });
+});
+
+describe("andel", () => {
+  it("avgiftsandel: 4 000 × 12 / 4 800 000 = 0,01", () => {
+    const r = kor(forening());
+    expect(r.prognos.andel?.metod).toBe("avgiftsandel");
+    expect(r.prognos.andel?.varde).toBeCloseTo(0.01, 10);
+  });
+  it("ytandel: 50 / 5 000 = 0,01 when årsavgifter missing", () => {
+    const r = kor(forening({ bostadsrattsyta: fig(5000, { unit: "m2" }) }), { kontrollsummor: {} });
+    expect(r.prognos.andel).toEqual({ varde: 0.01, metod: "ytandel" });
+  });
+  it("ytandel falls back to kontrollsummor.bostadsrattsyta", () => {
+    const r = kor(forening(), { kontrollsummor: { bostadsrattsyta: fig(2500, { unit: "m2" }) } });
+    expect(r.prognos.andel).toEqual({ varde: 0.02, metod: "ytandel" });
+  });
+  it("harledd: årsavgifter = 10 000 000 / (200/100) = 5 000 000 → 48 000 / 5 000 000 = 0,0096", () => {
+    const r = kor(forening({ ...lanebok(10_000_000), keyFigures: [rk(200)] }), {
+      kontrollsummor: {},
+    });
+    expect(r.prognos.andel?.metod).toBe("harledd_avgiftsandel");
+    expect(r.prognos.andel?.varde).toBeCloseTo(0.0096, 10);
+  });
+  it("unknown: every krPerManad and the total are null", () => {
+    const r = kor(
+      forening({
+        keyFigures: [sparande(-100)],
+        totalyta: fig(2000, { unit: "m2" }),
+      }),
+      {
+        kontrollsummor: {},
+      },
+    );
+    expect(r.prognos.andel).toBeNull();
+    expect(r.prognos.totalKrPerManad).toBeNull();
+    expect(r.prognos.komponenter.every((k) => k.krPerManad === null)).toBe(true);
+    // the BRF-level amount is still computed. Schablon target 300, gap 300 + 100 = 400,
+    // underskott 100 × 2 000 = 200 000 + lånebart 300 × 2 000 = 600 000 (skuld okänd →
+    // inget lånas, 2026-10-29) = 800 000
+    expect(komp(r, "spargap").foreningKrPerAr).toBe(800_000);
+  });
+  it("guards a share above 1 (årsavgifter 40 000 → 1,2) and falls through", () => {
+    const r = kor(forening(), { kontrollsummor: { arsavgifter: fig(40_000) } });
+    expect(r.prognos.andel).toBeNull();
+  });
+  it("guards zero årsavgifter", () => {
+    expect(kor(forening(), { kontrollsummor: { arsavgifter: fig(0) } }).prognos.andel).toBeNull();
+  });
+});
+
+describe("spargap (sparande mot underhållsbehov; no plan → schablon 300; skuld okänd → hela glappet via avgiften)", () => {
+  const med = (kf: KeyFigure | null, extra: Partial<Forening> = {}) =>
+    komp(
+      kor(
+        forening({
+          keyFigures: kf ? [kf] : [],
+          totalyta: fig(2000, { unit: "m2" }),
+          ...extra,
+        }),
+      ),
+      "spargap",
+    );
+  it("−100 kr/m²: underskott 100 + lånebart 300 = 400 × 2 000 = 800 000 kr/year (skuld okänd) → × 0,01 / 12 = 666,67 → 667", () => {
+    const k = med(sparande(-100));
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 800_000, krPerManad: 667 });
+    expect(k.ref?.page).toBe(5);
+    expect(k.label).toBe("Sparande mot underhållsbehov");
+  });
+  it("positive sparande is no longer ej_aktuell: 50 → gap 250 × 2 000 = 500 000 → 416,67 → 417", () => {
+    expect(med(sparande(50))).toMatchObject({
+      status: "beraknad",
+      foreningKrPerAr: 500_000,
+      krPerManad: 417,
+    });
+  });
+  it("a surplus is negative: 500 → gap −200 × 2 000 × 0,5 = −200 000 → −166,67 → −167", () => {
+    expect(med(sparande(500))).toMatchObject({ foreningKrPerAr: -200_000, krPerManad: -167 });
+  });
+  it("planned and financed withdrawal is no exception any more (schablon): calculated, and mentioned", () => {
+    const k = med(sparande(-100), { sparandeUttag: { planerat: "ja", finansierat: "ja" } });
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 800_000 });
+    expect(k.forklaring).toMatch(/finansierat uttag/);
+  });
+  it("plan target, financed withdrawal: gap logic as is (investeringsbehov 400, sparande −100 → 500 × 2 000 = 1 000 000)", () => {
+    const k = med(sparande(-100), {
+      sparandeUttag: { planerat: "ja", finansierat: "ja" },
+      underhallsplan: { finns: "ja", investeringsbehovPerM2: fig(400, { unit: "kr/m2" }) },
+    });
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 1_000_000 });
+    expect(k.forklaring).not.toMatch(/uttag/);
+  });
+  it("forklaring is one Swedish sentence with target, source, sparande and gap", () => {
+    const k = med(sparande(150));
+    // 300 − 150 = 150 kr/m²
+    // 150 × 2 000 m² = 300 000 kr/år (skuld okänd); andel 4 000 × 12 / 4 800 000 = 1 % → 250 kr/mån
+    expect(k.forklaring.replace(/\s/g, " ")).toBe(
+      "Sparandet är 150 kr/m² mot Binfos mål 300 kr/m² (schablon) – ett glapp på 150 kr/m². " +
+        "Föreningens skuld per kvadratmeter framgår inte, så glappet betalas med avgiften. " +
+        "Sammanlagt når ca 300 000 kr/år föreningens avgift. " +
+        "Din andel är 1 % (din avgift × 12 ÷ föreningens årsavgifter ≈ 4,8 mkr), alltså ca 250 kr/mån.",
+    );
+  });
+  it("value null with tecken negativ: saknar_underlag", () => {
+    expect(med(sparande(null, { tecken: "negativ", tryckt: "neg" })).status).toBe(
+      "saknar_underlag",
+    );
+  });
+  it("value null without sign, or no key figure: saknar_underlag", () => {
+    expect(med(sparande(null)).status).toBe("saknar_underlag");
+    expect(med(null).status).toBe("saknar_underlag");
+  });
+  it("no totalyta: saknar_underlag, but the prognosis still carries the sparbehov", () => {
+    const r = kor(forening({ keyFigures: [sparande(-100)] }));
+    expect(komp(r, "spargap").status).toBe("saknar_underlag");
+    expect(r.prognos.sparbehov).toMatchObject({
+      malKrPerM2: 300,
+      glappKrPerM2: 400,
+      totalyta: null,
+    });
+  });
+  it("byggår and hiss reach the schablon: byggår 1950 + hiss ja → 5/7 eftersatt → 336; gap 336 − 150 = 186 × 2 000 = 372 000", () => {
+    const f = forening({
+      keyFigures: [sparande(150)],
+      totalyta: fig(2000, { unit: "m2" }),
+      genomfordaAtgarder: [],
+    });
+    const r = kor(f, {
+      byggar: 1950,
+      hiss: "ja",
+    });
+    expect(r.prognos.sparbehov).toMatchObject({ malKrPerM2: 336, malKalla: "schablon" });
+    expect(komp(r, "spargap").foreningKrPerAr).toBe(372_000);
+  });
+  it("plan target: investeringsbehov 400, sparande 150 → 250 × 2 000 = 500 000 (dampning 1) → 416,67 → 417", () => {
+    const k = med(sparande(150), {
+      underhallsplan: { finns: "ja", investeringsbehovPerM2: fig(400, { unit: "kr/m2" }) },
+    });
+    expect(k).toMatchObject({ foreningKrPerAr: 500_000, krPerManad: 417 });
+  });
+});
+
+describe("refinansiering", () => {
+  const med = (f: Partial<Forening>, extra: Partial<AvgiftsprognosInput> = {}) =>
+    kor(forening(f), extra);
+
+  it("rörlig loan 1 000 000 @2,0 %: (2,648 − 2,0)/100 × 1 000 000 = 6 480/year → 5,4 → 5 kr/month", () => {
+    const r = med(lanebok(1_000_000, [lan(1_000_000, 2.0, undefined, "rorlig")]));
+    const k = komp(r, "refinansiering");
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 6480, krPerManad: 5 });
+    expect(r.omsattningsbarSkuld).toBe(1_000_000);
+    expect(r.prognos.refinansiering).toMatchObject({
+      forfallandeBelopp: 1_000_000,
+      nuvarandeRantaProcent: 2,
+      nyRantaProcent: 2.648,
+      marginalProcent: 0.58,
+      antalLan: 1,
+    });
+    expect(r.prognos.refinansiering?.antagenAndelProcent).toBeUndefined();
+  });
+  it("rörlig loan with a far date still counts", () => {
+    const k = komp(
+      med(lanebok(1_000_000, [lan(1_000_000, 2.0, "2031-01-01", "rorlig")])),
+      "refinansiering",
+    );
+    expect(k.foreningKrPerAr).toBe(6480);
+  });
+  it("negative: 1 000 000 @4,0 → (2,648 − 4,0) = −1,352 % → −13 520/year → −11,27 → −11", () => {
+    const k = komp(med(lanebok(1_000_000, [lan(1_000_000, 4.0, "2027-01-15")])), "refinansiering");
+    expect(k).toMatchObject({ foreningKrPerAr: -13_520, krPerManad: -11 });
+  });
+  it("a date already passed (2026-05-01 ≤ idag) is MATURED: listed as forfallit, never priced", () => {
+    const r = med(lanebok(1_000_000, [lan(1_000_000, 2.0, "2026-05-01")]));
+    const k = komp(r, "refinansiering");
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 0, krPerManad: 0 });
+    expect(k.forklaring).toMatch(/Lån på 1\s000\s000 kr hade villkorsändringsdag 1 maj 2026/);
+    expect(k.forklaring).toMatch(/troligen redan fått nya villkor som vi inte känner till/);
+    expect(r.omsattningsbarSkuld).toBe(0);
+    expect(r.prognos.refinansiering?.forfallandeBelopp).toBe(0);
+    expect(r.prognos.refinansiering?.lan).toEqual([
+      expect.objectContaining({
+        fas: "forfallit",
+        belopp: 1_000_000,
+        dag: "2026-05-01",
+        foreningKrPerAr: null,
+        vikt: 0,
+      }),
+    ]);
+    // not "uncovered debt": no 50 % assumption on top
+    expect(r.prognos.refinansiering?.antagenAndelProcent).toBeUndefined();
+    expect(r.totalSpannVidAntagande).toBeUndefined();
+  });
+  it("a maturity ON idag is matured; the day after is priced", () => {
+    const pa = med(lanebok(1_000_000, [lan(1_000_000, 2.0, IDAG)]));
+    expect(komp(pa, "refinansiering").foreningKrPerAr).toBe(0);
+    expect(pa.prognos.refinansiering?.lan?.[0]?.fas).toBe("forfallit");
+    const efter = med(lanebok(1_000_000, [lan(1_000_000, 2.0, "2026-10-25")]));
+    expect(komp(efter, "refinansiering").foreningKrPerAr).toBe(6480);
+  });
+  it("a rörlig loan with a passed date is not matured (it reprices continuously)", () => {
+    const k = komp(
+      med(lanebok(1_000_000, [lan(1_000_000, 2.0, "2026-05-01", "rorlig")])),
+      "refinansiering",
+    );
+    expect(k.foreningKrPerAr).toBe(6480);
+  });
+  it("horizon edge: 2028-10-24 is in, 2028-10-25 is out", () => {
+    const i = komp(med(lanebok(1_000_000, [lan(1_000_000, 2.0, "2028-10-24")])), "refinansiering");
+    expect(i.foreningKrPerAr).toBe(6480);
+    // 2028-10-25 is month 25 = the later phase (see "later phase" below); beyond month 60 nothing counts
+    const u = med(lanebok(1_000_000, [lan(1_000_000, 2.0, "2031-10-25")]));
+    expect(komp(u, "refinansiering")).toMatchObject({ status: "beraknad", foreningKrPerAr: 0 });
+    expect(u.omsattningsbarSkuld).toBe(0);
+  });
+  it("an undated loan among dated ones gets the 50 % assumption: 1 000 000 × 50 % × (2,648 − 2,0) % = 3 240, plus the dated one in month 25 (6 480 × 0,75 = 4 860) = 8 100", () => {
+    const u = med(
+      lanebok(2_000_000, [lan(1_000_000, 2.0, "2028-10-25"), lan(1_000_000, 2.0, undefined)], {
+        snittranta: fig(2.0, { unit: "procent" }),
+      }),
+    );
+    expect(komp(u, "refinansiering")).toMatchObject({ status: "beraknad", foreningKrPerAr: 8100 });
+    expect(u.omsattningsbarSkuld).toBe(500_000);
+    expect(u.prognos.refinansiering?.antagenAndelProcent).toBe(50);
+    expect(u.totalSpannVidAntagande).toBeDefined();
+  });
+  it("debt the loan rows don't cover (> 2 %) gets the 50 % assumption too", () => {
+    // rows 1 000 000 @2,0 dated 2029-12-01 = month 38 → weight 0,5 → 3 240 (later phase);
+    // total 3 000 000 → 2 000 000 uncovered → 1 000 000 × 0,648 % = 6 480; sum 9 720
+    const u = med(
+      lanebok(3_000_000, [lan(1_000_000, 2.0, "2029-12-01")], {
+        snittranta: fig(2.0, { unit: "procent" }),
+      }),
+    );
+    expect(komp(u, "refinansiering").foreningKrPerAr).toBe(9720);
+  });
+  it("a report older than 18 months (balansdag 2024-12-31, read 2026-10-24) → saknar_underlag", () => {
+    const r = med({
+      ...lanebok(1_000_000, [lan(1_000_000, 4.85, "2025-01-02")]),
+      rakenskapsar: 2024,
+      balansdag: "2024-12-31",
+    });
+    expect(komp(r, "refinansiering").status).toBe("saknar_underlag");
+    expect(r.antalSaknadeUnderlag).toBeGreaterThan(0);
+  });
+  it("stale report, Näcken-like: loans resetting after today are priced at the report's rate, passed ones are not: 9 472 000 × (2,648 − 3,25) % + 5 920 000 × (2,648 − 4,50) % = −166 660", () => {
+    const r = med({
+      ...lanebok(31_968_000, [
+        lan(10_656_000, 3.03, "2025-06-28"),
+        lan(5_920_000, 4.42, "2025-09-28"),
+        lan(9_472_000, 3.25, "2026-12-28"),
+        lan(5_920_000, 4.5, "2027-09-28"),
+      ]),
+      rakenskapsar: 2024,
+      balansdag: "2024-12-31",
+    });
+    const k = komp(r, "refinansiering");
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: -166_660 });
+    expect(k.forklaring).toMatch(
+      /Lån på 16\s576\s000 kr hade villkorsändringsdag 28 juni 2025 och 28 september 2025/,
+    );
+    expect(k.forklaring).toMatch(/troligen redan fått nya villkor som vi inte känner till/);
+    expect(r.prognos.refinansiering?.lan?.filter((l) => l.fas === "forfallit")).toHaveLength(2);
+    expect(k.forklaring).toMatch(/de 2 lån \(15\s392\s000 kr\) som omsätts efter i dag/);
+    expect(r.omsattningsbarSkuld).toBe(15_392_000);
+    expect(r.totalSpannVidAntagande).toBeUndefined();
+  });
+  it("debt-free (totalSkuld 0): beraknad 0", () => {
+    const r = med(lanebok(0));
+    expect(komp(r, "refinansiering")).toMatchObject({ status: "beraknad", foreningKrPerAr: 0 });
+    expect(r.omsattningsbarSkuld).toBe(0);
+  });
+  it("old extraction, forfalloprofil years only: 2027 → 2027-07-01 in, 2029 out", () => {
+    // 1 000 000 @3,0 in: (2,648−3,0) = −0,352 % → −3 520 → −2,93 → −3
+    const r = med({
+      lanebok: {
+        totalSkuld: fig(3_000_000),
+        forfalloprofil: [
+          { ar: 2027, belopp: fig(1_000_000), ranta: fig(3.0, { unit: "procent" }) },
+          { ar: 2029, belopp: fig(2_000_000), ranta: fig(3.0, { unit: "procent" }) },
+        ],
+      },
+    });
+    expect(komp(r, "refinansiering")).toMatchObject({ foreningKrPerAr: -3520, krPerManad: -3 });
+    expect(r.omsattningsbarSkuld).toBe(1_000_000);
+  });
+  it("old extraction, year-only maturity: a past YEAR (2025) is matured and the text says 'under 2025'; the current year (2026) is still priced", () => {
+    const r = med({
+      lanebok: {
+        totalSkuld: fig(3_000_000),
+        forfalloprofil: [
+          { ar: 2025, belopp: fig(1_000_000), ranta: fig(3.0, { unit: "procent" }) },
+          { ar: 2026, belopp: fig(2_000_000), ranta: fig(3.0, { unit: "procent" }) },
+        ],
+      },
+    });
+    const k = komp(r, "refinansiering");
+    expect(k.forklaring).toMatch(/hade villkorsändringsdag under 2025 och/);
+    expect(k.forklaring).not.toMatch(/1 juli/);
+    expect(r.omsattningsbarSkuld).toBe(2_000_000);
+    const rader = r.prognos.refinansiering?.lan ?? [];
+    expect(rader[0]).toMatchObject({ fas: "forfallit", belopp: 1_000_000, endastAr: true });
+    expect(rader[1]).toMatchObject({ fas: "inom_horisont", belopp: 2_000_000, endastAr: true });
+  });
+  it("missing maturities: 50 % of 2 000 000 @2,0 (snittränta) → 1 000 000 × 0,648 % = 6 480 → 5; spann 0 / 12 960/1200 = 10,8 → 11", () => {
+    const r = med(lanebok(2_000_000, undefined, { snittranta: fig(2.0, { unit: "procent" }) }));
+    expect(komp(r, "refinansiering")).toMatchObject({ foreningKrPerAr: 6480, krPerManad: 5 });
+    expect(r.omsattningsbarSkuld).toBe(1_000_000);
+    expect(r.prognos.refinansiering?.antagenAndelProcent).toBe(50);
+    expect(r.prognos.refinansiering?.forfallandeBelopp).toBe(1_000_000);
+    expect(r.totalSpannVidAntagande).toEqual({ lag: 0, hog: 11 });
+  });
+  it("missing maturities, loans without dates: assumed share too", () => {
+    const r = med(lanebok(2_000_000, [lan(2_000_000, 2.0, undefined)]));
+    expect(r.prognos.refinansiering?.antagenAndelProcent).toBe(50);
+  });
+  it("assumed case uses räntekostnader ÷ skuld when snittränta is missing: 60 000 / 2 000 000 = 3 %", () => {
+    // 1 000 000 × (2,648 − 3) = −3 520
+    const r = med(lanebok(2_000_000, undefined, { rantekostnader: fig(60_000) }));
+    expect(komp(r, "refinansiering").foreningKrPerAr).toBe(-3520);
+    // spann: hel = −7 040 /1200 = −5,87 → −6 ; lag −6, hog 0
+    expect(r.totalSpannVidAntagande).toEqual({ lag: -6, hog: 0 });
+  });
+  it("missing current rate: saknar_underlag, amount still reported", () => {
+    const r = med(lanebok(2_000_000));
+    expect(komp(r, "refinansiering").status).toBe("saknar_underlag");
+    expect(r.omsattningsbarSkuld).toBe(1_000_000);
+    expect(r.totalSpannVidAntagande).toBeUndefined();
+  });
+  it("repricing loan without any rate: saknar_underlag", () => {
+    const r = med(lanebok(1_000_000, [lan(1_000_000, null, "2027-01-01")]));
+    expect(komp(r, "refinansiering").status).toBe("saknar_underlag");
+    expect(r.omsattningsbarSkuld).toBe(1_000_000);
+  });
+  it("loan without own rate takes snittränta", () => {
+    const k = komp(
+      med(lanebok(1_000_000, [lan(1_000_000, null, "2027-01-01")], { snittranta: fig(2.0) })),
+      "refinansiering",
+    );
+    expect(k.foreningKrPerAr).toBe(6480);
+  });
+  it("no loans and no totalSkuld: saknar_underlag, omsattningsbarSkuld null", () => {
+    const r = med({});
+    expect(komp(r, "refinansiering").status).toBe("saknar_underlag");
+    expect(r.omsattningsbarSkuld).toBeNull();
+  });
+
+  it("Pontonjären-like (idag 2026-10-26, balansdag 2025-12-31): two loans matured, only the last two are priced → a small RISE", () => {
+    // new rate 2,648. Matured (not priced): 2 926 011 @2,53 on 2026-03-28, 1 180 000 @4,49 on 2026-09-28.
+    // Priced: 683 080 @2,51 (2026-11-28): 0,138 → +942,6504; 970 000 @2,43 (2026-12-28): 0,218 → +2 114,60
+    //  sum = +3 057,2504 → 3 057 kr/year; flat 3 057 × 0,01 / 12 = 2,55 → 3 kr/month.
+    // 2 000 000 @2,98 2028-10-28 is month 25 and dearer than 2,648 → not counted.
+    // amount repricing 1 653 080; weighted rate (683 080×2,51 + 970 000×2,43) / 1 653 080 = 2,4630 → 2,46
+    const r = med(
+      lanebok(7_759_091, [
+        lan(683_080, 2.51, "2026-11-28"),
+        lan(1_180_000, 4.49, "2026-09-28"),
+        lan(970_000, 2.43, "2026-12-28"),
+        lan(2_000_000, 2.98, "2028-10-28"),
+        lan(2_926_011, 2.53, "2026-03-28"),
+      ]),
+      { idag: "2026-10-26" },
+    );
+    const k = komp(r, "refinansiering");
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 3057, krPerManad: 3 });
+    expect(r.omsattningsbarSkuld).toBe(1_653_080);
+    expect(r.prognos.refinansiering).toMatchObject({
+      forfallandeBelopp: 1_653_080,
+      nuvarandeRantaProcent: 2.46,
+      nyRantaProcent: 2.648,
+      antalLan: 2,
+    });
+    const rader = r.prognos.refinansiering?.lan ?? [];
+    expect(rader.filter((l) => l.fas === "forfallit").map((l) => [l.dag, l.belopp])).toEqual([
+      ["2026-03-28", 2_926_011],
+      ["2026-09-28", 1_180_000],
+    ]);
+    expect(rader.filter((l) => l.fas === "inom_horisont")).toHaveLength(2);
+    expect(
+      rader.filter((l) => l.fas === "forfallit").every((l) => l.foreningKrPerAr === null),
+    ).toBe(true);
+    expect(k.forklaring).toMatch(
+      /Lån på 4\s106\s011 kr hade villkorsändringsdag 28 mars 2026 och 28 september 2026/,
+    );
+    expect(k.forklaring).toMatch(/höjer föreningens kostnad med cirka 3\s057 kr per år/);
+    expect(r.totalSpannVidAntagande).toBeUndefined();
+  });
+  it("matured loans are not 'uncovered debt': total debt = rows → no assumed 50 % share", () => {
+    const r = med(
+      lanebok(3_000_000, [lan(1_000_000, 2.0, "2026-01-01"), lan(2_000_000, 2.0, "2027-01-01")]),
+    );
+    expect(r.prognos.refinansiering?.antagenAndelProcent).toBeUndefined();
+    expect(r.omsattningsbarSkuld).toBe(2_000_000);
+  });
+});
+
+describe("underhall", () => {
+  const post = (
+    belopp: number,
+    finansiering: "lan" | "fond" | "beslutad" | "ofinansierad" | "okant",
+    extra: object = {},
+  ) => ({
+    text: "Åtgärd",
+    belopp: fig(belopp),
+    finansiering,
+    ...extra,
+  });
+  it("unfinanced minus fund minus savings: (3 000 000 − 1 000 000 − 100 000×10) / 10 = 100 000/year → 83 kr/month", () => {
+    // horizon years 2026–2028 (24 months). B (lån) excluded; C (fran 2040) and D (2030–2032) outside.
+    const k = komp(
+      kor(
+        forening({
+          underhallsplan: {
+            finns: "ja",
+            planeradeKostnader: [
+              post(3_000_000, "ofinansierad"),
+              post(2_000_000, "lan"),
+              post(1_000_000, "okant", { fran: 2040 }),
+              post(500_000, "okant", { fran: 2030, till: 2032 }),
+              post(700_000, "fond"),
+              post(800_000, "beslutad"),
+            ],
+            underhallsfond: fig(1_000_000),
+            arligAvsattning: fig(100_000),
+          },
+        }),
+      ),
+      "underhall",
+    );
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 100_000, krPerManad: 83 });
+  });
+  it("a span that overlaps the 24-month horizon counts (2028–2030), one starting 2029 does not", () => {
+    const k = komp(
+      kor(
+        forening({
+          underhallsplan: {
+            finns: "ja",
+            planeradeKostnader: [post(1_000_000, "okant", { fran: 2028, till: 2030 })],
+          },
+        }),
+      ),
+      "underhall",
+    );
+    expect(k.foreningKrPerAr).toBe(100_000);
+    const ute = komp(
+      kor(
+        forening({
+          underhallsplan: {
+            finns: "ja",
+            planeradeKostnader: [post(1_000_000, "okant", { fran: 2029, till: 2030 })],
+          },
+        }),
+      ),
+      "underhall",
+    );
+    expect(ute).toMatchObject({ status: "beraknad", foreningKrPerAr: 0 });
+  });
+  it("covered by the fund: beraknad 0", () => {
+    const k = komp(
+      kor(
+        forening({
+          underhallsplan: {
+            finns: "ja",
+            planeradeKostnader: [post(500_000, "ofinansierad")],
+            underhallsfond: fig(900_000),
+          },
+        }),
+      ),
+      "underhall",
+    );
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 0, krPerManad: 0 });
+  });
+  it("amounts all outside the window: beraknad 0", () => {
+    const k = komp(
+      kor(
+        forening({
+          underhallsplan: {
+            finns: "ja",
+            planeradeKostnader: [post(500_000, "ofinansierad", { fran: 2045 })],
+          },
+        }),
+      ),
+      "underhall",
+    );
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 0 });
+  });
+  it("no amounts: saknar_underlag in all three situations", () => {
+    expect(komp(kor(forening()), "underhall").status).toBe("saknar_underlag");
+    expect(komp(kor(forening({ underhallsplan: { finns: "nej" } })), "underhall").status).toBe(
+      "saknar_underlag",
+    );
+    const k = komp(
+      kor(forening({ underhallsplan: { finns: "ja", kommandeAtgarder: [{ text: "Stambyte" }] } })),
+      "underhall",
+    );
+    expect(k.status).toBe("saknar_underlag");
+    expect(k.foreningKrPerAr).toBeNull();
+  });
+});
+
+describe("lokaler (owner 2026-10-25: signal 100 %, unrenewed lease ending in the window 50 %)", () => {
+  // Default setup: idag 2026-10-24 → horizon end 2028-10-24; balansdag 2025-12-31 (rakenskapsar 2025).
+  // Flat share: BRF kr/year ÷ 1 200 = kr/month.
+  const avtal = (
+    slutdatum: string | undefined,
+    arshyra: number | undefined,
+    extra: {
+      text?: string;
+      fornyelse?: { text: string; nyttSlutdatum?: string };
+    } = {},
+  ) => ({
+    ...(extra.text ? { text: extra.text } : {}),
+    ...(slutdatum ? { slutdatum } : {}),
+    ...(arshyra !== undefined ? { arshyra: fig(arshyra) } : {}),
+    ref: { page: 7, excerpt: "lokal" },
+    ...(extra.fornyelse
+      ? { fornyelse: { ...extra.fornyelse, ref: { page: 7, excerpt: "förlängt" } } }
+      : {}),
+  });
+  const signal = (arshyra?: number, text = "Hyresgästen har sagt upp avtalet") => ({
+    text,
+    ...(arshyra !== undefined ? { arshyra: fig(arshyra) } : {}),
+    ref: { page: 8, excerpt: text },
+  });
+  // Whitespace normalised; the closing "Din andel är …" sentence is tested separately.
+  const ren = (t: string) => t.replace(/\s/g, " ").replace(/ Din andel är .*$/, "");
+
+  it("no lokaler: ej_aktuell", () => {
+    expect(komp(kor(forening()), "lokaler").status).toBe("ej_aktuell");
+    expect(komp(kor(forening({ antalLokaler: fig(0, { unit: "antal" }) })), "lokaler").status).toBe(
+      "ej_aktuell",
+    );
+  });
+  it("lokaler without a known rent or lease: ej_aktuell and no amount in the text", () => {
+    const k = komp(kor(forening({ antalLokaler: fig(3, { unit: "antal" }) })), "lokaler");
+    expect(k).toMatchObject({ status: "ej_aktuell", foreningKrPerAr: 0 });
+    expect(k.forklaring.startsWith("Föreningen hyr ut lokaler. Inget i")).toBe(true);
+  });
+  it("rent but no signal and no lease ending in the window: ej_aktuell with the 'Inget i årsredovisningen' text", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: { hyresintakter: fig(244_380), kontrakt: [avtal("2029-03-31", 244_380)] },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "ej_aktuell", foreningKrPerAr: 0 });
+    expect(ren(k.forklaring)).toBe(
+      "Föreningen hyr ut lokaler (244 380 kr per år). Inget i årsredovisningen tyder på att hyresintäkterna faller bort, så vi räknar inte med något bortfall.",
+    );
+  });
+  it("Volontären-like: one lease, no arshyra, hyresintakter 244 380, slut 2024-12-31, balansdag 2023-12-31, idag 2026-10-25 → 50 % = 122 190 kr/yr, 'löpte ut'", () => {
+    const r = kor(
+      forening({
+        balansdag: "2023-12-31",
+        rakenskapsar: 2023,
+        lokaler: {
+          hyresintakter: fig(244_380),
+          kontrakt: [avtal("2024-12-31", undefined, { text: "Kontoret (130,5 kvm)" })],
+        },
+      }),
+      { idag: "2026-10-25" },
+    );
+    const k = komp(r, "lokaler");
+    // 244 380 × 0,5 = 122 190; ÷ 1 200 = 101,8 → 102
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 122_190, krPerManad: 102 });
+    expect(ren(k.forklaring)).toBe(
+      "Hyresavtalet för kontoret (130,5 kvm) löpte ut 31 december 2024 och årsredovisningen säger inget om förlängning eller ny hyresgäst. Vi räknar med 50 % sannolikhet att hyran faller bort, cirka 122 190 kr per år för föreningen.",
+    );
+    expect(k.ref?.page).toBe(7);
+  });
+  it("a lease ending 2027-06-30 (future, in the window): 50 % of 100 000 = 50 000, 'löper ut'; 50 000 ÷ 1 200 = 41,7 → 42", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(300_000),
+            kontrakt: [avtal("2027-06-30", 100_000, { text: "butiken" })],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 50_000, krPerManad: 42 });
+    expect(ren(k.forklaring)).toMatch(/^Hyresavtalet för butiken löper ut 30 juni 2027 och /);
+  });
+  it("window edges: ending on the horizon end (2028-10-24) counts, a day later does not; on the balance date counts, a day earlier does not", () => {
+    const med = (slut: string) =>
+      komp(
+        kor(
+          forening({ lokaler: { hyresintakter: fig(200_000), kontrakt: [avtal(slut, 200_000)] } }),
+        ),
+        "lokaler",
+      ).foreningKrPerAr;
+    expect(med("2028-10-24")).toBe(100_000);
+    expect(med("2028-10-25")).toBe(0);
+    expect(med("2025-12-31")).toBe(100_000);
+    expect(med("2025-12-30")).toBe(0);
+  });
+  it("a lease ending 2029 (outside the window) → 0 kr, ej_aktuell", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: { hyresintakter: fig(300_000), kontrakt: [avtal("2029-01-31", 300_000)] },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "ej_aktuell", foreningKrPerAr: 0 });
+  });
+  it("a lease with fornyelse → 0 kr, ej_aktuell, the text says it is renewed and names the lease and date", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(300_000),
+            kontrakt: [
+              avtal("2026-12-31", 300_000, {
+                text: "kontoret",
+                fornyelse: { text: "Avtalet har förlängts", nyttSlutdatum: "2029-12-31" },
+              }),
+            ],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "ej_aktuell", foreningKrPerAr: 0 });
+    expect(ren(k.forklaring)).toContain(
+      "Hyresavtalet för kontoret löper ut 31 december 2026, men årsredovisningen säger att avtalet förlängts eller ersatts av ett nytt avtal som löper till 31 december 2029, så vi räknar inte med något bortfall.",
+    );
+    expect(ren(k.forklaring)).toMatch(/Inget i årsredovisningen tyder på/);
+  });
+  it("fornyelse without a new end date: 'förlängts eller att en ny hyresgäst har skrivit på'", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(300_000),
+            kontrakt: [avtal("2026-12-31", 300_000, { fornyelse: { text: "Ny hyresgäst" } })],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k.forklaring).toContain("förlängts eller att en ny hyresgäst har skrivit på");
+    expect(k.forklaring).toContain("Hyresavtalet för lokalen löper ut 31 december 2026");
+  });
+  it("a signal counts 100 %: rent 200 000 → 200 000 kr/yr, ÷ 1 200 = 166,7 → 167", () => {
+    const k = komp(
+      kor(
+        forening({ lokaler: { hyresintakter: fig(500_000), forlustsignaler: [signal(200_000)] } }),
+      ),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 200_000, krPerManad: 167 });
+    expect(k.ref?.page).toBe(8);
+    expect(ren(k.forklaring)).toBe(
+      "Årsredovisningen nämner: ”Hyresgästen har sagt upp avtalet”. Vi räknar med att hela hyran, 200 000 kr per år, faller bort.",
+    );
+  });
+  it("two signals 200 000 + 100 000 → 300 000 → 250 kr/month, 'Sammanlagt' sentence", () => {
+    const k = komp(
+      kor(forening({ lokaler: { forlustsignaler: [signal(200_000), signal(100_000)] } })),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 300_000, krPerManad: 250 });
+    expect(ren(k.forklaring)).toMatch(
+      /Sammanlagt räknar vi med cirka 300 000 kr per år för föreningen\.$/,
+    );
+  });
+  it("a long signal text is shortened in the explanation", () => {
+    const lang = "Hyresgästen " + "har sagt upp avtalet ".repeat(12);
+    const k = komp(
+      kor(forening({ lokaler: { forlustsignaler: [signal(100_000, lang)] } })),
+      "lokaler",
+    );
+    expect(k.forklaring).toContain("…”");
+    expect(k.forklaring.length).toBeLessThan(300);
+  });
+  it("signal without rent: 600 000 ÷ max(3 kontrakt, 0, 1) = 200 000 at 100 %", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(600_000),
+            kontrakt: [avtal(undefined, 1), avtal(undefined, 1), avtal(undefined, 1)],
+            forlustsignaler: [signal()],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 200_000 });
+  });
+  it("signal without rent: antalLokaler 4 beats 3 kontrakt → 600 000 ÷ 4 = 150 000", () => {
+    const k = komp(
+      kor(
+        forening({
+          antalLokaler: fig(4, { unit: "antal" }),
+          lokaler: {
+            hyresintakter: fig(600_000),
+            kontrakt: [avtal(undefined, 1), avtal(undefined, 1), avtal(undefined, 1)],
+            forlustsignaler: [signal()],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k.foreningKrPerAr).toBe(150_000);
+  });
+  it("two signals without rent are capped at hyresintakter: 300 000 + 300 000 scaled by 1/2 → 150 000 + 150 000 = 300 000", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: { hyresintakter: fig(300_000), forlustsignaler: [signal(), signal()] },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k.foreningKrPerAr).toBe(300_000);
+    expect(ren(k.forklaring)).toContain("hela hyran, 150 000 kr per år");
+  });
+  it("one signal with rent 100 000 + one without (300 000 ÷ 2 = 150 000): 250 000", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(300_000),
+            kontrakt: [avtal(undefined, 1), avtal(undefined, 1)],
+            forlustsignaler: [signal(100_000), signal()],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k.foreningKrPerAr).toBe(250_000);
+  });
+  it("signal 200 000 + lease 150 000 ending 2027-06-30, hyresintakter 300 000: signal 200 000 + lease capped to the 100 000 left × 0,5 = 50 000 → 250 000 (208 kr/month)", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(300_000),
+            kontrakt: [avtal("2027-06-30", 150_000, { text: "butiken" })],
+            forlustsignaler: [signal(200_000)],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 250_000, krPerManad: 208 });
+    const t = ren(k.forklaring);
+    expect(t).toContain("hela hyran, 200 000 kr per år, faller bort");
+    expect(t).toContain("cirka 50 000 kr per år för föreningen");
+    expect(t).toMatch(/Sammanlagt räknar vi med cirka 250 000 kr per år för föreningen\.$/);
+  });
+  it("signals that cover all of hyresintakter leave nothing for an ending lease: 200 000 only, lease 'redan inräknad ovan'", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(200_000),
+            kontrakt: [avtal("2027-06-30", 100_000, { text: "kontoret" })],
+            forlustsignaler: [signal(200_000)],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k.foreningKrPerAr).toBe(200_000);
+    expect(k.forklaring).toContain(
+      "Hyresavtalet för kontoret löper ut 30 juni 2027, men hyran är redan inräknad ovan.",
+    );
+  });
+  it("a lease with the same arshyra as a signal is the same rent: 200 000 + 200 000 → 200 000, not 300 000", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(500_000),
+            kontrakt: [avtal("2027-06-30", 200_000, { text: "kontoret" })],
+            forlustsignaler: [signal(200_000)],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k.foreningKrPerAr).toBe(200_000);
+    expect(k.forklaring).toContain("redan inräknad ovan");
+  });
+  it("two leases, one renewed: 250 000 × 0,5 = 125 000, the renewed one (150 000) adds 0; both are named", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(400_000),
+            kontrakt: [
+              avtal("2026-12-31", 250_000, { text: "kontoret" }),
+              avtal("2027-03-31", 150_000, {
+                text: "butiken",
+                fornyelse: { text: "Förlängt" },
+              }),
+            ],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 125_000, krPerManad: 104 });
+    const t = ren(k.forklaring);
+    expect(t).toContain("Hyresavtalet för kontoret löper ut 31 december 2026 och");
+    expect(t).toContain("cirka 125 000 kr per år för föreningen");
+    expect(t).toContain(
+      "Hyresavtalet för butiken löper ut 31 mars 2027, men årsredovisningen säger",
+    );
+    expect(t).not.toContain("Sammanlagt");
+  });
+  it("two unrenewed leases 100 000 + 60 000 (hyresintakter 200 000): 50 000 + 30 000 = 80 000, one sentence each + 'Sammanlagt'", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(200_000),
+            kontrakt: [
+              avtal("2026-12-31", 100_000, { text: "kontoret" }),
+              avtal("2027-06-30", 60_000, { text: "förrådet" }),
+            ],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k.foreningKrPerAr).toBe(80_000);
+    const t = ren(k.forklaring);
+    expect(t).toContain("kontoret löper ut 31 december 2026");
+    expect(t).toContain("cirka 50 000 kr per år");
+    expect(t).toContain("förrådet löper ut 30 juni 2027");
+    expect(t).toContain("cirka 30 000 kr per år");
+    expect(t).toMatch(/Sammanlagt räknar vi med cirka 80 000 kr per år för föreningen\.$/);
+  });
+  it("an old-style lease text that talks about the avtal falls back to 'lokalen'", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(100_000),
+            kontrakt: [avtal("2027-06-30", 100_000, { text: "Butikslokal, hyresavtal löper ut" })],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    expect(k.forklaring).toContain("Hyresavtalet för lokalen löper ut 30 juni 2027");
+  });
+  it("an old extraction (no fornyelse, no forlustsignaler) with a lease in the window counts as unrenewed (50 %)", () => {
+    const k = komp(
+      kor(forening({ lokaler: { kontrakt: [avtal("2026-12-31", 200_000)] } })),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 100_000 });
+  });
+  it("an empty signal list and no lease dates is no risk", () => {
+    const k = komp(
+      kor(forening({ lokaler: { hyresintakter: fig(300_000), forlustsignaler: [] } })),
+      "lokaler",
+    );
+    expect(k.status).toBe("ej_aktuell");
+  });
+  it("a lease in the window but no rent figure at all: saknar_underlag, names the lease, explains", () => {
+    const k = komp(
+      kor(
+        forening({ lokaler: { kontrakt: [avtal("2027-06-30", undefined, { text: "kontoret" })] } }),
+      ),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "saknar_underlag", foreningKrPerAr: null, krPerManad: null });
+    expect(k.forklaring).toContain("Hyresavtalet för kontoret löper ut 30 juni 2027");
+    expect(k.forklaring).toContain("står inte i årsredovisningen, så vi kan inte räkna ut");
+  });
+  it("signal but no rent figure at all: saknar_underlag", () => {
+    const k = komp(kor(forening({ lokaler: { forlustsignaler: [signal()] } })), "lokaler");
+    expect(k).toMatchObject({ status: "saknar_underlag", foreningKrPerAr: null });
+    expect(k.forklaring).toContain("Årsredovisningen nämner: ”Hyresgästen har sagt upp avtalet”.");
+  });
+  it("cited zero rent beats a signal: ej_aktuell", () => {
+    const k = komp(
+      kor(forening({ lokaler: { hyresintakter: fig(0), forlustsignaler: [signal()] } })),
+      "lokaler",
+    );
+    expect(k).toMatchObject({ status: "ej_aktuell", foreningKrPerAr: 0 });
+    expect(k.forklaring).toMatch(/inga hyresintäkter/);
+  });
+  it("the amounts named in the explanation add up to foreningKrPerAr", () => {
+    const k = komp(
+      kor(
+        forening({
+          lokaler: {
+            hyresintakter: fig(350_001),
+            kontrakt: [avtal("2026-12-31", 100_001), avtal("2027-06-30", 50_003)],
+            forlustsignaler: [signal(100_001 + 7)],
+          },
+        }),
+      ),
+      "lokaler",
+    );
+    // signal 100 008; leases ½ × 100 001 = 50 000,5 → 50 001 ; ½ × 50 003 = 25 001,5 → 25 002 (Math.round)
+    expect(k.foreningKrPerAr).toBe(100_008 + 50_001 + 25_002);
+  });
+});
+
+describe("energi", () => {
+  const p = (finansierat: "ja" | "nej" | "okant", belopp?: number) => ({
+    text: "Solceller",
+    finansierat,
+    ...(belopp !== undefined ? { belopp: fig(belopp) } : {}),
+    ref: { page: 3, excerpt: "sol" },
+  });
+  it("none: ej_aktuell", () => {
+    expect(komp(kor(forening()), "energi").status).toBe("ej_aktuell");
+  });
+  it("unfinanced 1 000 000 / 10 = 100 000 → 83,33 → 83; financed ones add 0", () => {
+    const k = komp(
+      kor(forening({ energiprojekt: [p("nej", 1_000_000), p("ja", 5_000_000)] })),
+      "energi",
+    );
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 100_000, krPerManad: 83 });
+  });
+  it("only financed: beraknad 0", () => {
+    expect(komp(kor(forening({ energiprojekt: [p("ja", 5_000_000)] })), "energi")).toMatchObject({
+      status: "beraknad",
+      foreningKrPerAr: 0,
+    });
+  });
+  it("unknown financing, or unfinanced without amount: saknar_underlag", () => {
+    expect(komp(kor(forening({ energiprojekt: [p("okant", 1_000_000)] })), "energi").status).toBe(
+      "saknar_underlag",
+    );
+    expect(komp(kor(forening({ energiprojekt: [p("nej")] })), "energi").status).toBe(
+      "saknar_underlag",
+    );
+  });
+});
+
+describe("total, guard and counts", () => {
+  it("total = Σ rounded beraknade components; saknar adds nothing and is counted", () => {
+    // spargap (sparande 100: gap 200 × 2 000 = 400 000) → 333 ; refinansiering 6 480 → 5 ; energi 100 000 → 83 ; underhåll saknar ; lokaler ej
+    const r = kor(
+      forening({
+        keyFigures: [sparande(100)],
+        totalyta: fig(2000, { unit: "m2" }),
+        ...lanebok(1_000_000, [lan(1_000_000, 2.0, undefined, "rorlig")]),
+        energiprojekt: [{ text: "Sol", finansierat: "nej", belopp: fig(1_000_000) }],
+      }),
+    );
+    expect(r.prognos.totalKrPerManad).toBe(333 + 5 + 83);
+    expect(r.antalSaknadeUnderlag).toBe(1);
+    expect(r.prognos.horisontManader).toBe(24);
+    expect(r.prognos.berakningsdatum).toBe(IDAG);
+    expect(r.prognos.osaker).toBeUndefined();
+  });
+  it("30 % guard: sparande −1 200 → underskott 1 200 + lånebart 300 = 1 500 × 2 000 = 3 000 000 → 2 500 kr > 0,3 × 4 000 = 1 200 → osäker", () => {
+    const r = kor(forening({ keyFigures: [sparande(-1200)], totalyta: fig(2000, { unit: "m2" }) }));
+    expect(r.prognos.totalKrPerManad).toBe(2500);
+    expect(r.prognos.osaker).toMatch(/osäker/);
+  });
+  it("30 % guard: exactly 1 200 is not flagged (sparande −420 → underskott 420 × 2 000 + lånebart 300 × 2 000 = 1 440 000 → 1 200)", () => {
+    const r = kor(forening({ keyFigures: [sparande(-420)], totalyta: fig(2000, { unit: "m2" }) }));
+    expect(r.prognos.totalKrPerManad).toBe(1200);
+    expect(r.prognos.osaker).toBeUndefined();
+  });
+  it("each component carries a Swedish label and an explanation", () => {
+    const r = kor(forening());
+    expect(r.prognos.komponenter.map((k) => k.id)).toEqual([
+      "spargap",
+      "refinansiering",
+      "underhall",
+      "lokaler",
+      "energi",
+      "beslutad_hojning",
+    ]);
+    for (const k of r.prognos.komponenter) {
+      expect(k.label.length).toBeGreaterThan(5);
+      expect(k.forklaring.endsWith(".")).toBe(true);
+    }
+  });
+});
+
+describe("lokaler with cited zero rent (Pontonjären 3: 'Hyresintäkter, lokaler 0 289 180')", () => {
+  it("is ej_aktuell, not saknar_underlag", async () => {
+    const { beraknaAvgiftsprognos } = await import("./avgiftsprognos");
+    const { extraktion } = await import("../__fixtures__/extraktion");
+    const r = beraknaAvgiftsprognos({
+      forening: {
+        ...extraktion.forening,
+        antalLokaler: {
+          value: 2,
+          unit: "antal",
+          source: "arsredovisning",
+          ref: { page: 4, excerpt: "2 lokaler" },
+        },
+        lokaler: {
+          hyresintakter: {
+            value: 0,
+            unit: "kr",
+            source: "arsredovisning",
+            ref: { page: 15, excerpt: "Hyresintäkter, lokaler 0 289 180" },
+          },
+        },
+      },
+      manadsavgift: 3503,
+      boarea: 48,
+      referensranta: {
+        namn: "x",
+        serie: "x",
+        datum: "2026-10-23",
+        procent: 2.068,
+        kalla: "x",
+        reserv: false,
+      },
+      idag: "2026-10-24",
+    });
+    expect(r.prognos.komponenter.find((k) => k.id === "lokaler")?.status).toBe("ej_aktuell");
+  });
+});
+
+describe("refinansiering, later phase (months 25–60 from idag 2026-10-24; weights 0,75 / 0,5 / 0,25)", () => {
+  // One loan 1 000 000 @2,0: (2,648 − 2,0) % = 6 480/year × weight; ÷ 1 200 → kr/month.
+  const ett = (dag: string, ranta = 2.0) =>
+    kor(forening(lanebok(1_000_000, [lan(1_000_000, ranta, dag)])));
+  const k = (r: ReturnType<typeof kor>) => komp(r, "refinansiering");
+
+  it.each([
+    ["2028-10-25", 25, 0.75, 4860, 4], // 4,05
+    ["2029-10-24", 36, 0.75, 4860, 4], // upper edge of the first band
+    ["2029-10-25", 37, 0.5, 3240, 3], // 2,7
+    ["2030-10-24", 48, 0.5, 3240, 3],
+    ["2030-10-25", 49, 0.25, 1620, 1], // 1,35
+    ["2031-10-24", 60, 0.25, 1620, 1],
+  ])("%s = month %i → weight %f → %i kr/year → %i kr/month", (dag, _m, vikt, perAr, perManad) => {
+    const r = ett(dag);
+    expect(k(r)).toMatchObject({
+      status: "beraknad",
+      foreningKrPerAr: perAr,
+      krPerManad: perManad,
+    });
+    expect(r.prognos.refinansiering?.lan).toEqual([
+      expect.objectContaining({
+        fas: "senare",
+        vikt,
+        foreningKrPerAr: perAr,
+        belopp: 1_000_000,
+        dag,
+      }),
+    ]);
+    expect(r.prognos.refinansiering?.senareHorisontManader).toBe(60);
+    // the ≤ 24-month figures describe that phase only
+    expect(r.prognos.refinansiering).toMatchObject({ forfallandeBelopp: 0, antalLan: 0 });
+    expect(r.omsattningsbarSkuld).toBe(0);
+    expect(k(r).forklaring).toMatch(/månad 25–60/);
+  });
+  it("month 61 (2031-10-25) is ignored", () => {
+    expect(k(ett("2031-10-25"))).toMatchObject({ status: "beraknad", foreningKrPerAr: 0 });
+  });
+  it("cheaper-only: a dearer loan at month 40 (@4,0) is ignored, a cheaper one (@2,0) counted at 0,5", () => {
+    const r = kor(
+      forening(
+        lanebok(2_000_000, [lan(1_000_000, 4.0, "2030-01-15"), lan(1_000_000, 2.0, "2030-01-15")]),
+      ),
+    );
+    expect(k(r).foreningKrPerAr).toBe(3240);
+    expect(r.prognos.refinansiering?.lan).toHaveLength(1);
+  });
+  it("a loan with exactly the new rate (2,648) adds nothing and is omitted", () => {
+    const r = ett("2030-01-15", 2.648);
+    expect(k(r).foreningKrPerAr).toBe(0);
+  });
+  it("both directions within 24 months, weight 1 (rows listed): +6 480 (rörlig @2,0) and −13 520 (@4,0 on 2027-01-15) = −7 040 → −5,87 → −6", () => {
+    const r = kor(
+      forening(
+        lanebok(2_000_000, [
+          lan(1_000_000, 2.0, undefined, "rorlig"),
+          lan(1_000_000, 4.0, "2027-01-15"),
+        ]),
+      ),
+    );
+    expect(k(r)).toMatchObject({ foreningKrPerAr: -7040, krPerManad: -6 });
+    expect(r.prognos.refinansiering?.lan?.map((x) => [x.fas, x.vikt, x.foreningKrPerAr])).toEqual([
+      ["inom_horisont", 1, 6480],
+      ["inom_horisont", 1, -13_520],
+    ]);
+  });
+  it("both phases add: 24-month loan @2,0 (6 480) + month-37 loan @2,0 (3 240) = 9 720; amount/rate describe the first phase", () => {
+    const r = kor(
+      forening(
+        lanebok(2_000_000, [lan(1_000_000, 2.0, "2027-01-15"), lan(1_000_000, 2.0, "2029-10-25")]),
+      ),
+    );
+    expect(k(r).foreningKrPerAr).toBe(9720);
+    expect(r.prognos.refinansiering).toMatchObject({
+      forfallandeBelopp: 1_000_000,
+      nuvarandeRantaProcent: 2,
+      antalLan: 1,
+    });
+    expect(r.prognos.refinansiering?.lan).toHaveLength(2);
+    expect(r.omsattningsbarSkuld).toBe(1_000_000);
+  });
+  it("old p8 extraction (forfalloprofil years only): 2027 @3,0 (−3 520) + 2029 → 2029-07-01 = month 33 @2,0 (6 480 × 0,75 = 4 860) = 1 340; 2032 ignored", () => {
+    const r = kor(
+      forening({
+        lanebok: {
+          totalSkuld: fig(3_000_000),
+          forfalloprofil: [
+            { ar: 2027, belopp: fig(1_000_000), ranta: fig(3.0, { unit: "procent" }) },
+            { ar: 2029, belopp: fig(1_000_000), ranta: fig(2.0, { unit: "procent" }) },
+            { ar: 2032, belopp: fig(1_000_000), ranta: fig(1.0, { unit: "procent" }) },
+          ],
+        },
+      }),
+    );
+    expect(k(r).foreningKrPerAr).toBe(1340);
+  });
+  it("a later-phase loan without own rate takes snittränta", () => {
+    const r = kor(
+      forening(lanebok(1_000_000, [lan(1_000_000, null, "2029-10-25")], { snittranta: fig(2.0) })),
+    );
+    expect(k(r).foreningKrPerAr).toBe(3240);
+  });
+  it("a later-phase loan without any rate is skipped without failing the component", () => {
+    expect(k(ett("2029-10-25", null as unknown as number)).status).toBe("beraknad");
+  });
+  it("a stale report still prices a later-phase loan resetting after today (balansdag 2024-12-31): 1 000 000 × 0,648 % × 0,5 = 3 240", () => {
+    const r = kor(
+      forening({
+        ...lanebok(1_000_000, [lan(1_000_000, 2.0, "2029-10-25")]),
+        rakenskapsar: 2024,
+        balansdag: "2024-12-31",
+      }),
+    );
+    expect(k(r)).toMatchObject({ status: "beraknad", foreningKrPerAr: 3240 });
+  });
+  it("no later phase for the undated/no-maturities assumption", () => {
+    const r = kor(forening(lanebok(2_000_000, undefined, { snittranta: fig(2.0) })));
+    expect(r.prognos.refinansiering?.senareHorisontManader).toBeUndefined();
+    expect(k(r).foreningKrPerAr).toBe(6480);
+  });
+});
+
+describe("narrowed underhåll next to a plan-based sparandegap", () => {
+  it("horizon item 5 000 000 (ofinansierad, 2026–2027) is only in underhåll; the fond item 3 000 000 (2030–2039) sets the target 150 → gap 0", () => {
+    const r = kor(
+      forening({
+        keyFigures: [sparande(150)],
+        totalyta: fig(2000, { unit: "m2" }),
+        underhallsplan: {
+          finns: "ja",
+          planeradeKostnader: [
+            {
+              text: "Stambyte",
+              belopp: fig(5_000_000),
+              finansiering: "ofinansierad",
+              fran: 2026,
+              till: 2027,
+            },
+            { text: "Tak", belopp: fig(3_000_000), finansiering: "fond", fran: 2030, till: 2039 },
+          ],
+        },
+      }),
+    );
+    expect(r.prognos.sparbehov).toMatchObject({ malKrPerM2: 150, malKalla: "planerade_kostnader" });
+    expect(komp(r, "spargap")).toMatchObject({ foreningKrPerAr: 0, krPerManad: 0 });
+    // 5 000 000 / 10 = 500 000/year → 416,67 → 417
+    expect(komp(r, "underhall")).toMatchObject({ foreningKrPerAr: 500_000, krPerManad: 417 });
+  });
+});
+
+describe("tryckFor (fee 4 000: 2 % = 80 kr, 10 % = 400 kr)", () => {
+  it("null → undefined; zero and decreases → gron", () => {
+    expect(tryckFor(null, 4000)).toBeUndefined();
+    expect(tryckFor(0, 4000)).toBe("gron");
+    expect(tryckFor(-500, 4000)).toBe("gron");
+  });
+  it("below 2 % gron, exactly 2 % gul", () => {
+    expect(tryckFor(79, 4000)).toBe("gron");
+    expect(tryckFor(80, 4000)).toBe("gul");
+  });
+  it("up to and including 10 % gul, above rod", () => {
+    expect(tryckFor(400, 4000)).toBe("gul");
+    expect(tryckFor(401, 4000)).toBe("rod");
+  });
+  it("a rise without a usable fee is undefined", () => {
+    expect(tryckFor(100, 0)).toBeUndefined();
+  });
+  it("is set on beraknade components and on the total: energi 1 000 000 → 83 kr = 2,075 % → gul", () => {
+    const r = kor(
+      forening({ energiprojekt: [{ text: "Sol", finansierat: "nej", belopp: fig(1_000_000) }] }),
+    );
+    expect(komp(r, "energi").tryck).toBe("gul");
+    expect(r.prognos.tryck).toBe("gul");
+    // not set on ej_aktuell / saknar_underlag
+    expect(komp(r, "lokaler").tryck).toBeUndefined();
+    expect(komp(r, "underhall").tryck).toBeUndefined();
+  });
+  it("unknown share: no tryck anywhere", () => {
+    const r = kor(forening(), { kontrollsummor: {} });
+    expect(r.prognos.tryck).toBeUndefined();
+    expect(r.prognos.komponenter.every((c) => c.tryck === undefined)).toBe(true);
+  });
+});
+
+describe("beslutad avgiftshöjning (internal check + component)", () => {
+  // Default flat: 50 m², månadsavgift 4 000, andel 0,01, årsavgifter 4 800 000, balansdag 2025-12-31,
+  // idag 2026-10-24. Key figure 960 kr/m² × 50 ÷ 12 = 4 000 kr/month (före); 10 % → 4 400 (efter).
+  const kfAvgift = (v: number | null, extra: Partial<Figure> = {}): KeyFigure => ({
+    id: "arsavgift_per_m2_brf_yta",
+    label: "Årsavgift",
+    figure: fig(v, { unit: "kr/m2", ...extra }),
+    status: "okant",
+    forklaring: "",
+  });
+  const andring = (
+    procent: number,
+    fran?: string,
+    status: Avgiftsandring["status"] = "beslutad",
+    extra: Partial<Figure> = {},
+  ): Avgiftsandring => ({
+    procent: fig(procent, { unit: "procent", ...extra }),
+    ...(fran ? { fran } : {}),
+    status,
+    text: "Höjning av årsavgiften",
+    ref: { page: 3, excerpt: "beslutat om höjning" },
+  });
+  const med = (
+    andringar: Avgiftsandring[],
+    opt: { fee?: number; key?: number | null; extra?: Partial<Forening>; idag?: string } = {},
+  ) =>
+    kor(
+      forening({
+        keyFigures: opt.key === null ? [] : [kfAvgift(opt.key ?? 960)],
+        avgiftsandringar: andringar,
+        ...opt.extra,
+      }),
+      { manadsavgift: opt.fee ?? 4000, ...(opt.idag ? { idag: opt.idag } : {}) },
+    );
+  const kontroll = (r: ReturnType<typeof kor>) => r.prognos.avgiftsandringKontroll ?? [];
+
+  it("no changes: no check, component ej_aktuell 0 with plain text", () => {
+    const r = kor(forening());
+    expect(r.prognos.avgiftsandringKontroll).toBeUndefined();
+    expect(komp(r, "beslutad_hojning")).toMatchObject({
+      label: "Beslutad avgiftshöjning som inte har trätt i kraft",
+      status: "ej_aktuell",
+      foreningKrPerAr: 0,
+    });
+  });
+
+  it("future date, fee = före: 960×50/12 = 4 000, ×1,10 = 4 400 → matchar_fore, ej_i_kraft, no conflict; adds 4 000×10 % = 400 kr/month", () => {
+    const r = med([andring(10, "2027-01-01")]);
+    expect(kontroll(r)).toEqual([
+      {
+        procent: 10,
+        fran: "2027-01-01",
+        datum: "framtida",
+        uppskattadAvgiftFore: 4000,
+        uppskattadAvgiftEfter: 4400,
+        avgift: "matchar_fore",
+        slutsats: "ej_i_kraft",
+        konflikt: false,
+        ref: { page: 3, excerpt: "beslutat om höjning" },
+      },
+    ]);
+    // 400 × 12 ÷ 0,01 = 480 000 kr/year for the förening; × 0,01 ÷ 12 = 400
+    expect(komp(r, "beslutad_hojning")).toMatchObject({
+      status: "beraknad",
+      foreningKrPerAr: 480_000,
+      krPerManad: 400,
+    });
+    expect(r.prognos.totalKrPerManad).toBeGreaterThanOrEqual(400);
+  });
+
+  it("passed date, fee = efter (4 400): i_kraft, no conflict → ej_aktuell with the one-sentence text", () => {
+    const r = med([andring(10, "2026-05-01")], { fee: 4400 });
+    expect(kontroll(r)[0]).toMatchObject({
+      datum: "passerat",
+      avgift: "matchar_efter",
+      slutsats: "i_kraft",
+      konflikt: false,
+    });
+    const k = komp(r, "beslutad_hojning");
+    expect(k).toMatchObject({ status: "ej_aktuell", foreningKrPerAr: 0 });
+    expect(k.forklaring).toBe(
+      "Den beslutade höjningen på 10 % från 1 maj 2026 ingår redan i din avgift.",
+    );
+  });
+
+  it("a raise in effect scales the report's årsavgifter in the share: fee 4 400 × 12 ÷ (4 800 000 × 1,10) = 0,01 (not 0,011)", () => {
+    const r = med([andring(10, "2026-05-01")], { fee: 4400 });
+    expect(r.prognos.andel?.metod).toBe("avgiftsandel");
+    expect(r.prognos.andel?.varde).toBeCloseTo(0.01, 9);
+    expect(r.hojningIKraft).toEqual({ faktor: 1.1, procent: [10] });
+  });
+
+  it("a raise not yet in effect leaves the share alone: fee 4 000 × 12 ÷ 4 800 000 = 0,01", () => {
+    const r = med([andring(10, "2027-01-01")], { fee: 4000 });
+    expect(r.prognos.andel?.varde).toBeCloseTo(0.01, 9);
+    expect(r.hojningIKraft).toEqual({ faktor: 1, procent: [] });
+  });
+
+  it("passed date but fee = före (4 000): date decides (i_kraft), konflikt true, nothing added", () => {
+    const r = med([andring(10, "2026-05-01")], { fee: 4000 });
+    expect(kontroll(r)[0]).toMatchObject({
+      datum: "passerat",
+      avgift: "matchar_fore",
+      slutsats: "i_kraft",
+      konflikt: true,
+    });
+    expect(komp(r, "beslutad_hojning").status).toBe("ej_aktuell");
+  });
+
+  it("future date but fee = efter (4 400): date decides (ej_i_kraft), konflikt true, adds 4 400×10 % = 440", () => {
+    const r = med([andring(10, "2027-01-01")], { fee: 4400 });
+    expect(kontroll(r)[0]).toMatchObject({
+      datum: "framtida",
+      avgift: "matchar_efter",
+      slutsats: "ej_i_kraft",
+      konflikt: true,
+    });
+    expect(komp(r, "beslutad_hojning")).toMatchObject({ status: "beraknad", krPerManad: 440 });
+  });
+
+  it("no date, fee closer to efter (4 400): the fee decides → i_kraft, no conflict", () => {
+    const r = med([andring(10)], { fee: 4400 });
+    expect(kontroll(r)[0]).toMatchObject({
+      datum: "okant",
+      avgift: "matchar_efter",
+      slutsats: "i_kraft",
+      konflikt: false,
+    });
+    expect(kontroll(r)[0]?.fran).toBeUndefined();
+    expect(komp(r, "beslutad_hojning").status).toBe("ej_aktuell");
+  });
+
+  it("no date, fee closer to före (4 100: |100| < |300|): ej_i_kraft → adds 4 100×10 % = 410", () => {
+    const r = med([andring(10)], { fee: 4100 });
+    expect(kontroll(r)[0]).toMatchObject({ avgift: "matchar_fore", slutsats: "ej_i_kraft" });
+    expect(komp(r, "beslutad_hojning")).toMatchObject({ status: "beraknad", krPerManad: 410 });
+  });
+
+  it("no date, fee exactly between (4 200): avgift okant → slutsats okant → saknar_underlag", () => {
+    const r = med([andring(10)], { fee: 4200 });
+    expect(kontroll(r)[0]).toMatchObject({ avgift: "okant", slutsats: "okant" });
+    const k = komp(r, "beslutad_hojning");
+    expect(k).toMatchObject({ status: "saknar_underlag", foreningKrPerAr: null, krPerManad: null });
+    expect(r.antalSaknadeUnderlag).toBeGreaterThanOrEqual(1);
+  });
+
+  it("no key figure + no date: estimates null, avgift okant, slutsats okant → saknar_underlag", () => {
+    const r = med([andring(25)], { key: null });
+    expect(kontroll(r)[0]).toMatchObject({
+      datum: "okant",
+      uppskattadAvgiftFore: null,
+      uppskattadAvgiftEfter: null,
+      avgift: "okant",
+      slutsats: "okant",
+      konflikt: false,
+    });
+    expect(komp(r, "beslutad_hojning").status).toBe("saknar_underlag");
+  });
+
+  it("no key figure but a future date: the date decides → ej_i_kraft, no conflict, adds 4 000×25 % = 1 000", () => {
+    const r = med([andring(25, "2027-01-01")], { key: null });
+    expect(kontroll(r)[0]).toMatchObject({
+      avgift: "okant",
+      slutsats: "ej_i_kraft",
+      konflikt: false,
+    });
+    expect(komp(r, "beslutad_hojning")).toMatchObject({ status: "beraknad", krPerManad: 1000 });
+  });
+
+  it("a key figure marked osäker is not used as an estimate", () => {
+    const r = kor(
+      forening({
+        keyFigures: [kfAvgift(960, { osaker: "kunde inte styrkas" })],
+        avgiftsandringar: [andring(10, "2027-01-01")],
+      }),
+    );
+    expect(kontroll(r)[0]).toMatchObject({ uppskattadAvgiftFore: null, avgift: "okant" });
+  });
+
+  it("a change on or before the balance date is already in the accounts: ignored", () => {
+    for (const fran of ["2025-05-01", "2025-12-31"]) {
+      const r = med([andring(10, fran)]);
+      expect(r.prognos.avgiftsandringKontroll).toBeUndefined();
+      expect(komp(r, "beslutad_hojning")).toMatchObject({
+        status: "ej_aktuell",
+        foreningKrPerAr: 0,
+      });
+    }
+    // the day after the balance date counts
+    expect(kontroll(med([andring(10, "2026-01-01")]))).toHaveLength(1);
+  });
+
+  it("a decrease (−5 %) and a 0 % change are ignored", () => {
+    const r = med([andring(-5, "2027-01-01"), andring(0, "2027-01-01")]);
+    expect(r.prognos.avgiftsandringKontroll).toBeUndefined();
+    expect(komp(r, "beslutad_hojning").status).toBe("ej_aktuell");
+  });
+
+  it("a procent marked osäker is ignored", () => {
+    const r = med([andring(10, "2027-01-01", "beslutad", { osaker: "x" })]);
+    expect(r.prognos.avgiftsandringKontroll).toBeUndefined();
+  });
+
+  it("two changes (10 % passed, 5 % future), fee 4 400: före/efter compound 4 000 → 4 400 → 4 620", () => {
+    // sorted by fran even if listed the other way round
+    const r = med([andring(5, "2027-01-01"), andring(10, "2026-05-01")], { fee: 4400 });
+    const [a, b] = kontroll(r);
+    expect(a).toMatchObject({
+      procent: 10,
+      datum: "passerat",
+      uppskattadAvgiftFore: 4000,
+      uppskattadAvgiftEfter: 4400,
+      avgift: "matchar_efter",
+      slutsats: "i_kraft",
+      konflikt: false,
+    });
+    expect(b).toMatchObject({
+      procent: 5,
+      datum: "framtida",
+      uppskattadAvgiftFore: 4400,
+      uppskattadAvgiftEfter: 4620,
+      avgift: "matchar_fore",
+      slutsats: "ej_i_kraft",
+      konflikt: false,
+    });
+    // only the future one: 4 400 × 5 % = 220
+    expect(komp(r, "beslutad_hojning")).toMatchObject({ status: "beraknad", krPerManad: 220 });
+    expect(komp(r, "beslutad_hojning").forklaring).toMatch(/ingår redan i din avgift/);
+  });
+
+  it("two future changes add up: 4 000 × 10 % + 4 000 × 5 % = 400 + 200 = 600", () => {
+    const r = med([andring(10, "2027-01-01"), andring(5, "2028-01-01")]);
+    expect(komp(r, "beslutad_hojning")).toMatchObject({ status: "beraknad", krPerManad: 600 });
+  });
+
+  it("one unknown among two → the whole component saknar_underlag", () => {
+    const r = med([andring(10, "2027-01-01"), andring(5)], { key: null });
+    expect(komp(r, "beslutad_hojning").status).toBe("saknar_underlag");
+  });
+
+  it("a planned change counts like a decided one and is worded as planned", () => {
+    const r = med([andring(10, "2027-01-01", "planerad")]);
+    const k = komp(r, "beslutad_hojning");
+    expect(k.status).toBe("beraknad");
+    expect(k.forklaring).toMatch(/planerad/);
+  });
+
+  it("the internal check never leaks into a buyer text", () => {
+    const r = med([andring(10, "2026-05-01")], { fee: 4000 });
+    for (const k of r.prognos.komponenter) {
+      expect(k.forklaring).not.toMatch(/konflikt|uppskatt|matchar/i);
+    }
+  });
+
+  it("Volontären-like: fee 2 104, 50 m², key figure 404, 25 % from 2024-05-01, idag 2026-10-25 → 1 683 / 2 104, matchar_efter, i_kraft", () => {
+    // 404 × 50 ÷ 12 = 1 683,33 ; × 1,25 = 2 104,17
+    const r = kor(
+      forening({
+        rakenskapsar: 2023,
+        keyFigures: [kfAvgift(404)],
+        avgiftsandringar: [andring(25, "2024-05-01")],
+      }),
+      { manadsavgift: 2104, idag: "2026-10-25" },
+    );
+    expect(kontroll(r)[0]).toMatchObject({
+      procent: 25,
+      fran: "2024-05-01",
+      datum: "passerat",
+      uppskattadAvgiftFore: 1683,
+      uppskattadAvgiftEfter: 2104,
+      avgift: "matchar_efter",
+      slutsats: "i_kraft",
+      konflikt: false,
+    });
+    expect(komp(r, "beslutad_hojning")).toMatchObject({ status: "ej_aktuell", foreningKrPerAr: 0 });
+    expect(komp(r, "beslutad_hojning").forklaring).toBe(
+      "Den beslutade höjningen på 25 % från 1 maj 2024 ingår redan i din avgift.",
+    );
+  });
+});
+
+describe("a decided raise answers the savings gap (offset on spargap)", () => {
+  // Default flat: spargap with sparande 100 on totalyta 2 000: (300 − 100) × 2 000 = 400 000 kr/year (no deficit part).
+  // Revenue of the förening = 4 000 × 12 ÷ 0,01 = 4 800 000 kr/year.
+  const andring = (procent: number, fran?: string): Avgiftsandring => ({
+    procent: {
+      value: procent,
+      unit: "procent",
+      source: "arsredovisning",
+      ref: { page: 3, excerpt: "höjning" },
+    },
+    ...(fran ? { fran } : {}),
+    status: "beslutad",
+    text: "Höjning",
+    ref: { page: 3, excerpt: "höjning" },
+  });
+  const med = (andringar: Avgiftsandring[], extra: Partial<Forening> = {}) =>
+    kor(
+      forening({
+        keyFigures: [sparande(100)],
+        totalyta: fig(2000, { unit: "m2" }),
+        avgiftsandringar: andringar,
+        ...extra,
+      }),
+    );
+
+  it("no raise: spargap unchanged (400 000)", () => {
+    expect(komp(med([]), "spargap").foreningKrPerAr).toBe(400_000);
+  });
+
+  it("future 5 % (4 800 000 × 5 % = 240 000): 400 000 − 240 000 = 160 000 → ÷ 1 200 = 133", () => {
+    const k = komp(med([andring(5, "2027-01-01")]), "spargap");
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 160_000, krPerManad: 133 });
+    expect(k.forklaring).toMatch(/höjningen av årsavgiften på 5 %/);
+    expect(k.forklaring).toMatch(/240\s000 kr av glappet/);
+  });
+
+  it("passed 5 % is already in the fee: the share uses 4 800 000 × 1,05, so the raise adds 4 800 000 × 0,05 = 240 000 → 160 000", () => {
+    const k = komp(med([andring(5, "2026-05-01")]), "spargap");
+    expect(k.foreningKrPerAr).toBe(160_000);
+  });
+
+  it("a raise larger than the gap floors at 0: 10 % = 480 000 > 400 000 → 0, 'hela glappet'", () => {
+    const k = komp(med([andring(10, "2027-01-01")]), "spargap");
+    expect(k).toMatchObject({ status: "beraknad", foreningKrPerAr: 0, krPerManad: 0 });
+    expect(k.forklaring).toMatch(/täcker hela glappet/);
+  });
+
+  it("an unknown raise (no date, no key figure) still offsets: 5 % → 160 000", () => {
+    const k = komp(med([andring(5)]), "spargap");
+    expect(k.foreningKrPerAr).toBe(160_000);
+  });
+
+  it("two raises add: 5 % + 3 % = 240 000 + 144 000 = 384 000 → 16 000", () => {
+    const k = komp(med([andring(5, "2027-01-01"), andring(3, "2028-01-01")]), "spargap");
+    expect(k.foreningKrPerAr).toBe(16_000);
+    expect(k.forklaring).toMatch(/höjningarna av årsavgiften på 5 % och 3 %/);
+  });
+
+  it("spargap not beraknad (no sparande): untouched, no sentence", () => {
+    const r = kor(
+      forening({
+        totalyta: fig(2000, { unit: "m2" }),
+        avgiftsandringar: [andring(5, "2027-01-01")],
+      }),
+    );
+    const k = komp(r, "spargap");
+    expect(k.status).toBe("saknar_underlag");
+    expect(k.forklaring).not.toMatch(/höjning/);
+  });
+
+  it("a surplus (sparande 500 → −200 000) is not offset", () => {
+    const r = kor(
+      forening({
+        keyFigures: [sparande(500)],
+        totalyta: fig(2000, { unit: "m2" }),
+        avgiftsandringar: [andring(5, "2027-01-01")],
+      }),
+    );
+    expect(komp(r, "spargap").foreningKrPerAr).toBe(-200_000);
+  });
+
+  it("other components are not offset: energi 1 000 000 ÷ 10 = 100 000 stays", () => {
+    const r = med([andring(5, "2027-01-01")], {
+      energiprojekt: [{ text: "Sol", finansierat: "nej", belopp: fig(1_000_000) }],
+    });
+    expect(komp(r, "energi").foreningKrPerAr).toBe(100_000);
+  });
+
+  it("raises on or before the balance date offset nothing", () => {
+    expect(komp(med([andring(5, "2025-05-01")]), "spargap").foreningKrPerAr).toBe(400_000);
+  });
+
+  it("decided raise is not double counted in the total: spargap 160 000 → 133 plus the raise component 200 (5 % of 4 000)", () => {
+    const r = med([andring(5, "2027-01-01")]);
+    expect(komp(r, "beslutad_hojning").krPerManad).toBe(200);
+    expect(r.prognos.totalKrPerManad).toBe(133 + 200);
+  });
+});
+
+describe("the flat's share is stated in every component text (round 2026-10-26)", () => {
+  const sol = (belopp: number) => ({
+    text: "Solceller",
+    finansierat: "nej" as const,
+    belopp: fig(belopp),
+    ref: { page: 3, excerpt: "sol" },
+  });
+  it("energi: per-year amount, then andel 1 % with its basis and kr/mån", () => {
+    const k = komp(kor(forening({ energiprojekt: [sol(1_000_000)] })), "energi");
+    expect(k.forklaring.replace(/\s/g, " ")).toBe(
+      "Energiprojekt för 1 000 000 kr saknar finansiering, fördelat på 10 år: 100 000 kr per år. " +
+        "Din andel är 1 % (din avgift × 12 ÷ föreningens årsavgifter ≈ 4,8 mkr), alltså ca 83 kr/mån.",
+    );
+  });
+  it("ytandel: the basis is the boarea ÷ bostadsrättsyta", () => {
+    const k = komp(
+      kor(
+        forening({ bostadsrattsyta: fig(5000, { unit: "m2" }), energiprojekt: [sol(1_000_000)] }),
+        {
+          kontrollsummor: {},
+        },
+      ),
+      "energi",
+    );
+    expect(k.forklaring).toContain("(din boarea 50 m² ÷ föreningens bostadsrättsyta ≈ 5");
+    expect(k.forklaring).toMatch(/alltså ca 83 kr\/mån\.$/);
+  });
+  it("a zero amount gets no share sentence; an unknown share neither", () => {
+    expect(komp(kor(forening({ energiprojekt: [] })), "energi").forklaring).not.toMatch(/andel/);
+    const utan = komp(
+      kor(forening({ energiprojekt: [sol(1_000_000)] }), { kontrollsummor: {} }),
+      "energi",
+    );
+    expect(utan.forklaring).not.toMatch(/Din andel/);
+  });
+  it("refinansiering: the share sentence follows the per-year amount", () => {
+    const k = komp(
+      kor(forening(lanebok(1_000_000, [lan(1_000_000, 2.0, undefined, "rorlig")]))),
+      "refinansiering",
+    );
+    expect(k.forklaring.replace(/\s/g, " ")).toMatch(
+      /cirka 6 480 kr per år\. Din andel är 1 % \(.*\), alltså ca 5 kr\/mån\.$/,
+    );
+  });
+  it("a decided raise shows its own arithmetic (fee × %)", () => {
+    const k = komp(
+      kor(
+        forening({
+          avgiftsandringar: [
+            {
+              status: "beslutad",
+              text: "Höjning",
+              procent: fig(10, { unit: "procent" }),
+              fran: "2027-01-01",
+              ref: { page: 3, excerpt: "höjning" },
+            },
+          ],
+        }),
+      ),
+      "beslutad_hojning",
+    );
+    expect(k.forklaring.replace(/\s/g, " ")).toContain(
+      "Vi räknar din avgift 4 000 kr × 10 % = cirka 400 kr i månaden.",
+    );
+  });
+});
+
+describe("Ingemar 8: borrowed gap reaches the fee as interest only (owner 2026-10-29)", () => {
+  it("BRF 36 060 kr/year → flat with avgift 3 100 and årsavgifter 1 359 772: ≈ 82 kr/month; text names the years and the ceiling", () => {
+    const r = kor(
+      forening({
+        rakenskapsar: 2025,
+        keyFigures: [
+          sparande(-3),
+          {
+            id: "skuldsattning_per_m2_totalyta",
+            label: "Skuld",
+            figure: fig(3411, { unit: "kr/m2" }),
+            status: "okant",
+            forklaring: "",
+          },
+        ],
+        totalyta: fig(2485, { unit: "m2" }),
+        sparandeHistorik: [-138, 125, 119].map((v, i) => ({
+          ar: 2024 - i,
+          figure: fig(v, { unit: "kr/m2" }),
+        })),
+      }),
+      { manadsavgift: 3100, kontrollsummor: { arsavgifter: fig(1_359_772) } },
+    );
+    const k = komp(r, "spargap");
+    expect(k.foreningKrPerAr).toBeGreaterThan(36_000);
+    expect(k.foreningKrPerAr).toBeLessThan(36_100);
+    expect(r.prognos.andel?.varde).toBeCloseTo((3100 * 12) / 1_359_772, 8);
+    expect(k.krPerManad).toBe(
+      Math.round(((k.foreningKrPerAr as number) * 3100 * 12) / 1_359_772 / 12),
+    );
+    expect(k.forklaring).toMatch(/snitt 2022–2025/);
+    expect(k.forklaring).toMatch(/under Binfos gräns på 5\s000 kr\/m²/);
+    expect(k.forklaring).toMatch(/inom två år når bara räntan avgiften/);
+    expect(k.forklaring).not.toMatch(/halva/);
+  });
+});

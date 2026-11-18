@@ -1,0 +1,71 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+.output
+.vinxi
+.tanstack/**
+.nitro
+*.local
+
+# Wrangler / Cloudflare
+.wrangler/
+.dev.vars
+
+# Supabase CLI local state / build output
+supabase/.temp/
+supabase/.branches/
+supabase/functions/*/_bundle/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Real annual reports used for testing. These are third-party documents and may
+# name individuals — keep them out of the repo entirely.
+/samples/
+/fixtures/pdf/
+/annual reports examples/
+
+# Pipeline scratch output
+/tmp/
+*.extraction.json
+
+# Claude Code supervisor working plan (local only)
+.claude/working-plan*.md
+
+# Offline ML environment
+ml/.venv/
+__pycache__/
+ml/mapping/sources/raw/
+
+# Claude Code agent worktrees (local only)
+.claude/worktrees/
+
+# Booli sold-data pulls (scripts/hamtaBooliSalda.ts): terms for keeping the data not confirmed
+data/raw/booli/
+
+# Public repo: third-party data without a republishing licence (kept in the private repo)
+fixtures/booli/*.html
+fixtures/booli-api/
+data/raw/*.xlsx
